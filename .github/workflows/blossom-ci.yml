@@ -11,6 +11,7 @@ permissions:
   statuses: write
 jobs:
   failure-verdict:
+    if: github.event.action == 'opened'
     name: ${{ matrix.case }}
     runs-on: blossom
     timeout-minutes: 5
@@ -116,3 +117,49 @@ jobs:
                 core.setFailed('Expected commit status for this run was not found');
               }
             }
+  feedback-permission-denied:
+    name: feedback-permission-denied
+    if: github.event.action == 'synchronize'
+    runs-on: blossom
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: read
+    steps:
+      - name: Record initial status IDs
+        id: before
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {data} = await github.rest.repos.listCommitStatusesForRef({...context.repo, ref: context.payload.pull_request.head.sha});
+            core.setOutput('ids', JSON.stringify(data.map(s => s.id)));
+      - name: Fail configuration with read-only feedback credentials
+        id: failure
+        continue-on-error: true
+        run: blossom-ci
+        env:
+          OPERATION: AUTH
+          SECRET_TOKEN: ''
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AUDIT_LOG_FILE: ${{ runner.temp }}/blossom-feedback-permission-denied.log
+      - name: Verify failure exit, audit and absent status write
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          STEP_OUTCOME: ${{ steps.failure.outcome }}
+          BEFORE_IDS: ${{ steps.before.outputs.ids }}
+        with:
+          script: |
+            const fs = require('fs');
+            const crypto = require('crypto');
+            core.info('Deployed blossom-ci SHA256: ' + crypto.createHash('sha256').update(fs.readFileSync('/home/github/bin/blossom-ci')).digest('hex'));
+            if (process.env.STEP_OUTCOME !== 'failure') core.setFailed('Expected operator failure exit');
+            const audit = fs.readFileSync(process.env.RUNNER_TEMP + '/blossom-feedback-permission-denied.log', 'utf8');
+            for (const line of audit.split('\n').filter(Boolean)) core.info('Audit evidence: ' + line);
+            if (!audit.includes('"status": "failure"') || !audit.includes('"code":"environment"')) core.setFailed('Missing failure audit');
+            const {data} = await github.rest.repos.listCommitStatusesForRef({...context.repo, ref: context.payload.pull_request.head.sha});
+            const before = JSON.parse(process.env.BEFORE_IDS);
+            const added = data.filter(s => !before.includes(s.id) && s.context === 'blossom-ci');
+            core.info('New blossom-ci status writes: ' + added.length);
+            if (added.length !== 0) core.setFailed('Read-only token unexpectedly created a status');
