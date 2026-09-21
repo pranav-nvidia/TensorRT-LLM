@@ -1,165 +1,102 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-name: Blossom deployed-runner failure validation
+name: Blossom deployed-runner comment validation
 on:
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [synchronize]
     paths: [.github/workflows/blossom-ci.yml]
 permissions:
   contents: read
+  issues: write
   pull-requests: write
   statuses: write
 jobs:
-  failure-verdict:
-    if: github.event.action == 'opened'
-    name: ${{ matrix.case }}
+  comment-verdicts:
     runs-on: blossom
-    timeout-minutes: 5
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        include:
-          - case: missing-operation
-            operation: ''
-          - case: missing-audit-path
-            operation: AUTH
-          - case: audit-path-is-directory
-            operation: AUTH
-          - case: configuration-secret-missing
-            operation: AUTH
-          - case: automatic-pr-auth-rejection
-            operation: AUTH
-          - case: automatic-pr-dispatch-rejection
-            operation: START-CI-JOB
-          - case: feedback-token-missing
-            operation: AUTH
+    timeout-minutes: 10
     steps:
-      - name: Identify deployed executable
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const crypto = require('crypto');
-            const path = '/home/github/bin/blossom-ci';
-            const sha = crypto.createHash('sha256').update(fs.readFileSync(path)).digest('hex');
-            core.info('Deployed blossom-ci SHA256: ' + sha);
-            core.info('Runner: ' + process.env.RUNNER_NAME);
-      - name: Exercise missing configuration secret
-        id: config
-        if: matrix.case == 'configuration-secret-missing'
-        continue-on-error: true
-        run: blossom-ci
-        env:
-          OPERATION: AUTH
-          SECRET_TOKEN: ''
-          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO_KEY_DATA: ${{ secrets.BLOSSOM_KEY }}
-          AUDIT_LOG_FILE: ${{ runner.temp }}/blossom-${{ matrix.case }}.log
-      - name: Exercise failure path
-        id: verdict
-        if: matrix.case != 'configuration-secret-missing'
-        continue-on-error: true
-        run: blossom-ci
-        env:
-          OPERATION: ${{ matrix.operation }}
-          REPO_TOKEN: ${{ matrix.case != 'feedback-token-missing' && secrets.GITHUB_TOKEN || '' }}
-          REPO_KEY_DATA: ${{ secrets.BLOSSOM_KEY }}
-          CI_SERVER: ${{ secrets.CI_SERVER }}
-          AUDIT_LOG_FILE: ${{ matrix.case != 'missing-audit-path' && (matrix.case == 'audit-path-is-directory' && runner.temp || format('{0}/blossom-{1}.log', runner.temp, matrix.case)) || '' }}
-      - name: Record expected exit and audit evidence
-        if: always()
+      - name: Verify controlled failure feedback from the deployed executable
         uses: actions/github-script@v7
         env:
-          TEST_CASE: ${{ matrix.case }}
-          CONFIG_OUTCOME: ${{ steps.config.outcome }}
-          VERDICT_OUTCOME: ${{ steps.verdict.outcome }}
+          PROBE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PROBE_KEY: ${{ secrets.BLOSSOM_KEY }}
         with:
           script: |
+            // Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
             const fs = require('fs');
+            const os = require('os');
             const path = require('path');
-            const testCase = process.env.TEST_CASE;
-            const outcome = testCase === 'configuration-secret-missing' ? process.env.CONFIG_OUTCOME : process.env.VERDICT_OUTCOME;
-            core.info('Case: ' + testCase + '; operator step outcome: ' + outcome);
-            if (outcome !== 'failure') core.setFailed('Expected a nonzero operator exit');
-            const auditPath = path.join(process.env.RUNNER_TEMP, 'blossom-' + testCase + '.log');
-            const expectedAudit = {
-              'missing-operation': ['failure', 'environment'],
-              'configuration-secret-missing': ['failure', 'environment'],
-              'automatic-pr-auth-rejection': ['declined', 'auto-trigger-commits'],
-              'automatic-pr-dispatch-rejection': ['failure', 'auto-trigger-commits'],
-              'feedback-token-missing': ['failure', 'environment']
-            }[testCase];
-            if (fs.existsSync(auditPath)) {
-              const text = fs.readFileSync(auditPath, 'utf8');
-              const records = [];
-              for (const line of text.split('\n').filter(Boolean)) {
-                core.info('Audit evidence: ' + line);
-                const start = line.indexOf('{');
-                if (start >= 0) records.push(JSON.parse(line.slice(start)));
-              }
-              if (expectedAudit && !records.some(r => r.status === expectedAudit[0] && r.code === expectedAudit[1])) {
-                core.setFailed('Expected audit verdict was not found');
-              }
-            } else {
-              core.info('No test audit file; startup failures fall back to runner stderr.');
-            }
-            if (testCase !== 'feedback-token-missing') {
-              const {data: statuses} = await github.rest.repos.listCommitStatusesForRef({
-                ...context.repo, ref: context.payload.pull_request.head.sha
-              });
-              const status = statuses.find(s => s.context === 'blossom-ci');
-              const expected = testCase === 'automatic-pr-auth-rejection' ? 'pending' : 'failure';
-              core.info('Commit-status evidence: ' + JSON.stringify(status && {
-                state: status.state, description: status.description, target_url: status.target_url
-              }));
-              if (!status || status.state !== expected || !status.target_url.endsWith('/' + context.runId)) {
-                core.setFailed('Expected commit status for this run was not found');
-              }
-            }
-  feedback-permission-denied:
-    name: feedback-permission-denied
-    if: github.event.action == 'synchronize'
-    runs-on: blossom
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      pull-requests: read
-      statuses: read
-    steps:
-      - name: Record initial status IDs
-        id: before
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const {data} = await github.rest.repos.listCommitStatusesForRef({...context.repo, ref: context.payload.pull_request.head.sha});
-            core.setOutput('ids', JSON.stringify(data.map(s => s.id)));
-      - name: Fail configuration with read-only feedback credentials
-        id: failure
-        continue-on-error: true
-        run: blossom-ci
-        env:
-          OPERATION: AUTH
-          SECRET_TOKEN: ''
-          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          AUDIT_LOG_FILE: ${{ runner.temp }}/blossom-feedback-permission-denied.log
-      - name: Verify failure exit, audit and absent status write
-        if: always()
-        uses: actions/github-script@v7
-        env:
-          STEP_OUTCOME: ${{ steps.failure.outcome }}
-          BEFORE_IDS: ${{ steps.before.outputs.ids }}
-        with:
-          script: |
-            const fs = require('fs');
             const crypto = require('crypto');
-            core.info('Deployed blossom-ci SHA256: ' + crypto.createHash('sha256').update(fs.readFileSync('/home/github/bin/blossom-ci')).digest('hex'));
-            if (process.env.STEP_OUTCOME !== 'failure') core.setFailed('Expected operator failure exit');
-            const audit = fs.readFileSync(process.env.RUNNER_TEMP + '/blossom-feedback-permission-denied.log', 'utf8');
-            for (const line of audit.split('\n').filter(Boolean)) core.info('Audit evidence: ' + line);
-            if (!audit.includes('"status": "failure"') || !audit.includes('"code":"environment"')) core.setFailed('Missing failure audit');
-            const {data} = await github.rest.repos.listCommitStatusesForRef({...context.repo, ref: context.payload.pull_request.head.sha});
-            const before = JSON.parse(process.env.BEFORE_IDS);
-            const added = data.filter(s => !before.includes(s.id) && s.context === 'blossom-ci');
-            core.info('New blossom-ci status writes: ' + added.length);
-            if (added.length !== 0) core.setFailed('Read-only token unexpectedly created a status');
+            const cp = require('child_process');
+            const binary = '/home/github/bin/blossom-ci';
+            core.info('Deployed blossom-ci SHA256: ' + crypto.createHash('sha256').update(fs.readFileSync(binary)).digest('hex'));
+            const scenarios = [
+              {name:'missing-operation-comment', kind:'operation', reactions:['-1'], status:'failure', code:'environment'},
+              {name:'missing-audit-comment', kind:'audit-missing', reactions:['-1'], status:'failure', code:'environment'},
+              {name:'audit-directory-comment', kind:'audit-directory', reactions:['-1'], status:'failure', code:'audit-log'},
+              {name:'receipt-before-configuration-failure', kind:'configuration', reactions:['eyes','-1'], status:'failure', code:'environment'},
+              {name:'operator-authorization-rejection', kind:'authorization', reactions:['eyes','-1'], status:'failure', code:'authorization'},
+              {name:'invalid-token-feedback', kind:'invalid-token', reactions:[], status:null, code:'environment'},
+              {name:'null-event', kind:'null', reactions:[], status:null, code:'event-data'},
+              {name:'malformed-event', kind:'malformed', reactions:[], status:null, code:'event-data'},
+              {name:'unreadable-event', kind:'unreadable', reactions:[], status:null, code:'event-data'},
+              {name:'missing-event-path', kind:'missing-path', reactions:[], status:null, code:'event-data'}
+            ];
+            const prNumber = context.payload.pull_request.number;
+            const headSha = context.payload.pull_request.head.sha;
+            const results = [];
+            for (const scenario of scenarios) {
+              core.startGroup(scenario.name);
+              const {data: comment} = await github.rest.issues.createComment({...context.repo, issue_number:prNumber,
+                body:'Controlled deployed-runner validation: `' + scenario.name + '`. Synthetic event input; expected failure, no Jenkins dispatch.'});
+              const {data: previous} = await github.rest.repos.listCommitStatusesForRef({...context.repo,ref:headSha});
+              const previousIds = new Set(previous.map(s=>s.id));
+              const dir = fs.mkdtempSync(path.join(os.tmpdir(),'blossom-verdict-'));
+              const eventPath = path.join(dir,'event.json');
+              const auditPath = path.join(dir,'audit.log');
+              const event = {action:'created',comment:{id:comment.id,body:'/bot run'},issue:{number:prNumber,pull_request:{}}};
+              fs.writeFileSync(eventPath,JSON.stringify(event));
+              const env = {...process.env, GITHUB_EVENT_NAME:'issue_comment',GITHUB_EVENT_PATH:eventPath,
+                OPERATION:'AUTH',AUDIT_LOG_FILE:auditPath,REPO_TOKEN:process.env.PROBE_TOKEN,
+                REPO_KEY_DATA:process.env.PROBE_KEY};
+              if (scenario.kind==='operation') env.OPERATION='';
+              if (scenario.kind==='audit-missing') env.AUDIT_LOG_FILE='';
+              if (scenario.kind==='audit-directory') env.AUDIT_LOG_FILE=dir;
+              if (['configuration','invalid-token'].includes(scenario.kind)) env.SECRET_TOKEN='';
+              if (scenario.kind==='authorization') env.GITHUB_ACTOR='blossom-mr84-unregistered-test-user';
+              if (scenario.kind==='invalid-token') env.REPO_TOKEN='invalid-blossom-test-token';
+              if (scenario.kind==='null') fs.writeFileSync(eventPath,'null');
+              if (scenario.kind==='malformed') fs.writeFileSync(eventPath,'{');
+              if (scenario.kind==='unreadable') env.GITHUB_EVENT_PATH=path.join(dir,'absent.json');
+              if (scenario.kind==='missing-path') delete env.GITHUB_EVENT_PATH;
+              const execution = await new Promise(resolve => cp.execFile(binary,[],{env,cwd:dir,timeout:60000},
+                (error,stdout,stderr)=>resolve({exit:error?error.code:0,stdout,stderr})));
+              const audit = fs.existsSync(auditPath)?fs.readFileSync(auditPath,'utf8'):execution.stderr;
+              const records=[];
+              for (const line of audit.split('\n')) {
+                const start=line.indexOf('{');
+                if(start>=0) {try {records.push(JSON.parse(line.slice(start)));} catch(e) {}}
+              }
+              const {data: reactions} = await github.rest.reactions.listForIssueComment({...context.repo,comment_id:comment.id});
+              const observed = reactions.filter(r=>r.user.login==='github-actions[bot]').map(r=>r.content);
+              const {data: statuses} = await github.rest.repos.listCommitStatusesForRef({...context.repo,ref:headSha});
+              const added = statuses.filter(s=>!previousIds.has(s.id)&&s.context==='blossom-ci');
+              const auditOk=records.some(r=>r.status==='failure'&&r.code===scenario.code);
+              const reactionOk=JSON.stringify(observed)===JSON.stringify(scenario.reactions);
+              const statusOk=scenario.status===null?added.length===0:added.length===1&&added[0].state===scenario.status;
+              const passed=execution.exit===255&&auditOk&&reactionOk&&statusOk;
+              const result={case:scenario.name,passed,exit:execution.exit,audit:records,reactions:observed,
+                statuses:added.map(s=>({state:s.state,description:s.description,target_url:s.target_url})),comment:comment.html_url};
+              core.info('VERIFIED_RESULT '+JSON.stringify(result));
+              for(const line of execution.stdout.split('\n')) {
+                if(/^(SECRET_TOKEN environment variable missing|OPERATION environment variable missing|AUDIT_LOG_FILE environment variable missing|Failed to start job: user not authorised|Not authorized !!!|Failed to update github status !!!|Failed to acknowledge comment|Event data file contains no event payload|GITHUB_EVENT_PATH environment variable missing|Failed to open event data file|Failed to Unmarshal event data)/.test(line)) core.info('Observed: '+line);
+              }
+              if(!passed) core.setFailed('Unexpected verdict for '+scenario.name);
+              results.push(result);
+              fs.rmSync(dir,{recursive:true,force:true});
+              core.endGroup();
+            }
+            await core.summary.addHeading('Deployed-binary comment and event validation').addTable([
+             [{data:'Case',header:true},{data:'Result',header:true},{data:'Reactions',header:true}],
+             ...results.map(r=>[r.case,r.passed?'PASS':'FAIL',r.reactions.join(', ')||'none'])
+            ]).write();
