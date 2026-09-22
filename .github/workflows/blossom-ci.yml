@@ -12,7 +12,7 @@ permissions:
   pull-requests: write
   statuses: write
 env:
-  FIXTURE_NAME: http-403
+  FIXTURE_NAME: http-503
 jobs:
   Authorization:
     name: Authorization
