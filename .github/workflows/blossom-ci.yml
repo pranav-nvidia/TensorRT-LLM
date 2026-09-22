@@ -4,7 +4,7 @@ name: Blossom pass 2 policy validation
 on:
   pull_request:
     types: [opened, synchronize]
-    paths: [.github/workflows/blossom-ci.yml, .github/blossom-pass2/**]
+    paths: [.github/workflows/blossom-ci.yml, .github/blossom-pass2/**, blossom-pass2-policy-fixture/**]
 permissions:
   contents: read
   actions: read

@@ -1,6 +1,6 @@
 // Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 // Invoke from actions/github-script in START-CI-JOB after a fresh real scan.
-// Requires webhook-fixture.cjs alongside this module. This file has not run on the deployed runner.
+// Requires webhook-fixture.cjs alongside this module. The deployed-binary harness has run on the test runner.
 'use strict';
 const fs = require('node:fs');
 const os = require('node:os');
@@ -20,9 +20,10 @@ async function runDispatchProbe({github, context, core, fixtureName, prNumber, e
   const blocked = reason => {
     const result = {case: fixtureName, result: 'BLOCKED', reason, runId: context.runId};
     core.info('PASS2_RESULT '+JSON.stringify(result));
-    core.setFailed(`E08 ${fixtureName}: BLOCKED; ${reason}`);
+    core.setFailed(`${fixtureName === 'policy-rejection' ? 'E06' : 'E08'} ${fixtureName}: BLOCKED; ${reason}`);
     return result;
   };
+  const caseId = fixtureName === 'policy-rejection' ? 'E06' : 'E08';
   const token = process.env.PROBE_TOKEN;
   if (!token || !expectedPrHeadSha || !Number.isInteger(prNumber)) {
     throw new Error('Missing test credentials or captured PR identity');
@@ -40,7 +41,7 @@ async function runDispatchProbe({github, context, core, fixtureName, prNumber, e
   const beforeComments = policyTest ? new Set((await github.paginate(github.rest.issues.listComments, {...context.repo, issue_number:prNumber, per_page:100})).map(c=>c.id)) : null;
   consumedRuns.add(context.runId);
   const {data: comment} = await github.rest.issues.createComment({...context.repo, issue_number: prNumber,
-    body: `E08 pass 2 controlled webhook: ${fixtureName}. START-CI-JOB probe; this marker is not an AUTH receipt test.`});
+    body: `${caseId} pass 2 controlled webhook: ${fixtureName}. START-CI-JOB probe; this marker is not an AUTH receipt test.`});
   const statuses = () => github.paginate(github.rest.repos.listCommitStatusesForRef,
     {...context.repo, ref: expectedPrHeadSha, per_page: 100});
   const before = new Set((await statuses()).map(s => s.id));
@@ -79,8 +80,8 @@ async function runDispatchProbe({github, context, core, fixtureName, prNumber, e
           {...context.repo,issue_number:prNumber,per_page:100});
         policyReports = comments.filter(c=>!beforeComments.has(c.id) &&
           c.user.login==='github-actions[bot]' && c.body.includes('Promotion blocked, new vulnerability found') &&
-          /minimist\s*\|\s*CVE-\d{4}-\d+/.test(c.body)).map(c=>({id:c.id,url:c.html_url,
-            rows:c.body.split('\n').filter(l=>/minimist\s*\|\s*CVE-\d{4}-\d+/.test(l))}));
+          /lodash\s*\|\s*CVE-\d{4}-\d+/i.test(c.body)).map(c=>({id:c.id,url:c.html_url,
+            rows:c.body.split('\n').filter(l=>/lodash\s*\|\s*CVE-\d{4}-\d+/i.test(l))}));
         const failures = [];
         if (fixture.evidence.dispatchRequests!==0) failures.push('Gate did not block dispatch');
         if (execution.exit!==255) failures.push('Expected exit 255');
@@ -89,7 +90,7 @@ async function runDispatchProbe({github, context, core, fixtureName, prNumber, e
             newStatuses[0].description!=='L2 vulnerability scan check failed !!!') failures.push('Missing fresh scan failure status');
         if (!auditRecords.some(r=>r.status==='failure' && r.code==='scan')) failures.push('Missing scan failure audit');
         if (auditRecords.some(r=>r.status==='job-start' || r.status==='success')) failures.push('Unexpected dispatch audit');
-        if (!policyReports.length) failures.push('No new report with a concrete minimist CVE');
+        if (!policyReports.length) failures.push('No new report with a concrete lodash CVE');
         if (execution.stdout.includes('Failed to get security vulnerability exceptions issue from gitlab')) failures.push('Exceptions loading failed');
         verdict = {result:failures.length?'FAIL':'PASS',failures};
       } else {
@@ -103,9 +104,9 @@ async function runDispatchProbe({github, context, core, fixtureName, prNumber, e
       const diagnostics = execution.stdout.split('\n').filter(l => /^(CI server (accepted|refused) dispatch: HTTP \d+$|CI dispatch response exceeded the response size limit$|Failed to read CI dispatch response body$|Failed to dispatch CI job: HTTP request failed$|Failed to get security vulnerability exceptions issue from gitlab$|L2 vulnerability scan check failed !!!$)/.test(l));
       const result = {case: fixtureName, ...verdict, ...fixture.evidence, exit: execution.exit,
         binarySha256, comment: comment.html_url, runUrl, newReactions, newStatuses,
-        auditVerdicts: auditRecords.map(r => ({status: r.status, code: r.code})), diagnostics, policyReports};
+        auditVerdicts: auditRecords.map(r => ({status: r.status, code: r.code})), diagnostics, policyReports, expectedComponent: policyTest ? 'lodash' : undefined, expectedVersion: policyTest ? '4.17.11' : undefined};
       core.info('PASS2_RESULT '+JSON.stringify(result));
-      if (result.result !== 'PASS') core.setFailed(`E08 ${fixtureName}: ${result.result}; inspect PASS2_RESULT`);
+      if (result.result !== 'PASS') core.setFailed(`${caseId} ${fixtureName}: ${result.result}; inspect PASS2_RESULT`);
       return result;
     });
   } finally {
