@@ -84,11 +84,13 @@ jobs:
             const path = require('node:path');
             const dir = fs.mkdtempSync(path.join(os.tmpdir(),'blossom-pass2-code-'));
             try {
-              for (const name of ['webhook-fixture.cjs','run-dispatch-probe.cjs']) {
+              for (const name of ['webhook-fixture.cjs','run-dispatch-probe.cjs','policy-diagnostics.cjs']) {
                 const {data} = await github.rest.repos.getContent({...context.repo,
                   path:'.github/blossom-pass2/'+name,ref:context.payload.pull_request.head.sha});
                 fs.writeFileSync(path.join(dir,name),Buffer.from(data.content,'base64'));
               }
+              const {inspectPolicy} = require(path.join(dir,'policy-diagnostics.cjs'));
+              await inspectPolicy({core,context});
               const {runDispatchProbe} = require(path.join(dir,'run-dispatch-probe.cjs'));
               await runDispatchProbe({github,context,core,fixtureName:process.env.FIXTURE_NAME,
                 prNumber:context.payload.pull_request.number,expectedPrHeadSha:context.payload.pull_request.head.sha});
