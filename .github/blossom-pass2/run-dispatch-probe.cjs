@@ -80,8 +80,8 @@ async function runDispatchProbe({github, context, core, fixtureName, prNumber, e
           {...context.repo,issue_number:prNumber,per_page:100});
         policyReports = comments.filter(c=>!beforeComments.has(c.id) &&
           c.user.login==='github-actions[bot]' && c.body.includes('Promotion blocked, new vulnerability found') &&
-          /(?:lodash|minimist)\s*\|\s*CVE-\d{4}-\d+/i.test(c.body)).map(c=>({id:c.id,url:c.html_url,
-            rows:c.body.split('\n').filter(l=>/(?:lodash|minimist)\s*\|\s*CVE-\d{4}-\d+/i.test(l))}));
+          /accelerate\s*\|\s*CVE-2026-69112/i.test(c.body)).map(c=>({id:c.id,url:c.html_url,
+            rows:c.body.split('\n').filter(l=>/accelerate\s*\|\s*CVE-2026-69112/i.test(l))}));
         const failures = [];
         if (fixture.evidence.dispatchRequests!==0) failures.push('Gate did not block dispatch');
         if (execution.exit!==255) failures.push('Expected exit 255');
@@ -90,7 +90,7 @@ async function runDispatchProbe({github, context, core, fixtureName, prNumber, e
             newStatuses[0].description!=='L2 vulnerability scan check failed !!!') failures.push('Missing fresh scan failure status');
         if (!auditRecords.some(r=>r.status==='failure' && r.code==='scan')) failures.push('Missing scan failure audit');
         if (auditRecords.some(r=>r.status==='job-start' || r.status==='success')) failures.push('Unexpected dispatch audit');
-        if (!policyReports.length) failures.push('No new report with a concrete lodash/minimist CVE');
+        if (!policyReports.length) failures.push('No new report with accelerate CVE-2026-69112');
         if (execution.stdout.includes('Failed to get security vulnerability exceptions issue from gitlab')) failures.push('Exceptions loading failed');
         verdict = {result:failures.length?'FAIL':'PASS',failures};
       } else {
@@ -104,7 +104,7 @@ async function runDispatchProbe({github, context, core, fixtureName, prNumber, e
       const diagnostics = execution.stdout.split('\n').filter(l => /^(CI server (accepted|refused) dispatch: HTTP \d+$|CI dispatch response exceeded the response size limit$|Failed to read CI dispatch response body$|Failed to dispatch CI job: HTTP request failed$|Failed to get security vulnerability exceptions issue from gitlab$|L2 vulnerability scan check failed !!!$)/.test(l));
       const result = {case: fixtureName, ...verdict, ...fixture.evidence, exit: execution.exit,
         binarySha256, comment: comment.html_url, runUrl, newReactions, newStatuses,
-        auditVerdicts: auditRecords.map(r => ({status: r.status, code: r.code})), diagnostics, policyReports, expectedComponent: policyTest ? 'lodash + minimist' : undefined, expectedVersion: policyTest ? '4.17.11 + 0.0.8' : undefined};
+        auditVerdicts: auditRecords.map(r => ({status: r.status, code: r.code})), diagnostics, policyReports, expectedComponent: policyTest ? 'accelerate' : undefined, expectedVersion: policyTest ? '1.14.0' : undefined};
       core.info('PASS2_RESULT '+JSON.stringify(result));
       if (result.result !== 'PASS') core.setFailed(`${caseId} ${fixtureName}: ${result.result}; inspect PASS2_RESULT`);
       return result;

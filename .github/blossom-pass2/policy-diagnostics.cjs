@@ -75,7 +75,7 @@ async function inspectPolicy({core, context}) {
     const allExceptions=fields(exceptionDocument,'Exceptions') ?? [];
     if(!Array.isArray(allExceptions))fail(stage,'invalid-exceptions-shape');
     const exceptions=new Set(allExceptions.filter(s=>s.includes('[SECURITY]')));
-    const isFixture=name=>/lodash|minimist/i.test(name||'');
+    const isFixture=name=>/lodash|minimist|accelerate/i.test(name||'');
     const mime='application/vnd.blackducksoftware.bill-of-materials-6+json';
     const paginate=async href=>{
       const items=[];let totalCount=0;let firstPage=[];
@@ -111,6 +111,7 @@ async function inspectPolicy({core, context}) {
       exceptionCount:exceptions.size,exceptionFileRevision:file.last_commit_id,exceptionFileSha256:crypto.createHash('sha256').update(decoded).digest('hex'),
       fixtureExceptionIds:[...exceptions].filter(isFixture),
       bomTotal:components.totalCount,bomTruncated:components.truncated,
+      componentInventory:components.items.slice(0,100).map(c=>({name:c.componentName,version:c.componentVersionName,matchTypes:c.matchTypes})),
       fixtureComponents:components.items.filter(c=>isFixture(c.componentName)).map(c=>({name:c.componentName,version:c.componentVersionName,matchTypes:c.matchTypes,vulnerabilityRiskProfile:c.vulnerabilityRiskProfile})),
       vulnerableTotal:vulnerable.totalCount,vulnerableTruncated:vulnerable.truncated,
       first300:classify(vulnerable.firstPage),allRetrieved:classify(vulnerable.items),fixtureVulnerabilities};
