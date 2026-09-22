@@ -1,0 +1,24 @@
+{
+  "copyright": "Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.",
+  "parent_report": "https://github.com/NVIDIA/TensorRT-LLM/pull/18766#issuecomment-5595002694",
+  "parent_revision_before_report": "cf8f7d092a9f874143f30d84e6243cc0474301de",
+  "lockfile": "security_scanning/poetry.lock",
+  "component": "accelerate",
+  "version": "1.14.0",
+  "candidate_cve": "CVE-2026-69112",
+  "purpose": "Static scan input only. Upstream archives preserved unchanged; never install or execute.",
+  "artifacts": [
+    {
+      "file": "accelerate-1.14.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/a8/db/253133d7e7cb40d3af384bb2f5c0b4a2b7fdcffbc95c688cc67a20a3c103/accelerate-1.14.0-py3-none-any.whl",
+      "sha256": "e94390c2863b873be18f623f9df48a0d8fe5eff13ea7f1a00092b0a7904888c6",
+      "size": 389246
+    },
+    {
+      "file": "accelerate-1.14.0.tar.gz",
+      "url": "https://files.pythonhosted.org/packages/8d/75/94cd5d389649578aca399e5aa822637eec18319a1dadc400ffe2f9a7493f/accelerate-1.14.0.tar.gz",
+      "sha256": "41b9c4377a54e0b460a959b0defa1b736e4ca0a2373252d9a539964c2afe3c8d",
+      "size": 412167
+    }
+  ]
+}
