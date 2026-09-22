@@ -1,0 +1,9 @@
+{
+  "_comment": "Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved. Synthetic scan input only; do not install or execute.",
+  "name": "blossom-pass2-policy-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "minimist": "0.0.8"
+  }
+}

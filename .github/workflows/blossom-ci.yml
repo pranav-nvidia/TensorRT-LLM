@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-name: Blossom pass 2 HTTP validation
+name: Blossom pass 2 policy validation
 on:
   pull_request:
     types: [opened, synchronize]
@@ -12,7 +12,7 @@ permissions:
   pull-requests: write
   statuses: write
 env:
-  FIXTURE_NAME: http-403
+  FIXTURE_NAME: policy-rejection
 jobs:
   Authorization:
     name: Authorization
@@ -68,7 +68,7 @@ jobs:
           args2: ${{ fromJson(needs.Authorization.outputs.args).args2 }}
           args3: ${{ fromJson(needs.Authorization.outputs.args).args3 }}
   Job-trigger:
-    name: Controlled HTTP verdict
+    name: Controlled policy verdict
     needs: [Vulnerability-scan]
     runs-on: blossom
     timeout-minutes: 10
