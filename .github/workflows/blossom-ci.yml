@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # A workflow to trigger ci on hybrid infra (github + self hosted runner)
-name: Blossom-CI
+name: Blossom template rejection probe 20260923
 on:
   issue_comment:
     types: [created]
