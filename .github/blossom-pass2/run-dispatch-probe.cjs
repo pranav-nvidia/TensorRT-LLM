@@ -76,7 +76,7 @@ async function runDispatchProbe({github, context, core, fixtureName, prNumber, e
         verdict.result = 'INVALID'; verdict.reason = 'PR head changed during the probe';
       }
       // Publish selected evidence only. Never log the request body, URL token, full stdout or stderr.
-      const diagnostics = execution.stdout.split('\n').filter(l => /^(CI server (accepted|refused) dispatch: HTTP \d+$|CI dispatch response exceeds 16384-byte logging threshold.*$|Failed to read CI dispatch response body$|Failed to dispatch CI job: HTTP request failed$|Failed to get security vulnerability exceptions issue from gitlab$|L2 vulnerability scan check failed !!!$)/.test(l));
+      const diagnostics = execution.stdout.split('\n').filter(l => /^(CI server (accepted|refused) dispatch: HTTP \d+$|CI dispatch response exceeds 131072-byte logging threshold.*$|Failed to read CI dispatch response body$|Failed to dispatch CI job: HTTP request failed$|Failed to get security vulnerability exceptions issue from gitlab$|L2 vulnerability scan check failed !!!$)/.test(l));
       const result = {case: fixtureName, ...verdict, ...fixture.evidence, exit: execution.exit,
         binarySha256, comment: comment.html_url, runUrl, newReactions, newStatuses,
         auditVerdicts: auditRecords.map(r => ({status: r.status, code: r.code})), diagnostics};

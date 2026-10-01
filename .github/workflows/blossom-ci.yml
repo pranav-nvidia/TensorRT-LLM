@@ -7,7 +7,7 @@ on:
       fixture:
         type: choice
         default: http-200
-        options: [http-200, http-204, http-299, http-302, http-403, http-503, body-at-limit, body-over-limit, body-128k]
+        options: [http-200, http-204, http-299, http-302, http-403, http-503, body-at-limit, body-over-limit, body-128k, body-128k-plus-one, body-over-read-cap]
       pr:
         description: 'Open, mergeable fixture PR number'
         type: string

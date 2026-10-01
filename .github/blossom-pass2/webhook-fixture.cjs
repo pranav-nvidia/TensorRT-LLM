@@ -2,6 +2,8 @@
 // Local response fixture only. It never replaces Blossom, AUTH, or the scan gate.
 'use strict';
 const http = require('node:http');
+const loggingThreshold = 128 * 1024;
+const responseReadLimit = 4 * loggingThreshold + 1;
 
 const scenarios = Object.freeze({
   'http-200': {status: 200, outcome: 'accepted'},
@@ -14,7 +16,9 @@ const scenarios = Object.freeze({
   'http-503': {status: 503, outcome: 'refused'},
   'body-at-limit': {status: 200, outcome: 'accepted', bytes: 16 * 1024},
   'body-over-limit': {status: 200, outcome: 'accepted', bytes: 16 * 1024 + 1},
-  'body-128k': {status: 200, outcome: 'accepted', bytes: 128 * 1024},
+  'body-128k': {status: 200, outcome: 'accepted', bytes: loggingThreshold},
+  'body-128k-plus-one': {status: 200, outcome: 'accepted', bytes: loggingThreshold + 1},
+  'body-over-read-cap': {status: 200, outcome: 'accepted', bytes: 1024 * 1024},
   'body-truncated': {status: 200, outcome: 'unreadable', truncated: true},
   'connection-reset': {status: null, outcome: 'request-error', reset: true},
 });
@@ -114,8 +118,9 @@ function assessDispatch(fixture, observed) {
     requireCheck(observed.stdout.includes(`CI server refused dispatch: HTTP ${fixture.scenario.status}`),
       'Missing numeric refusal diagnostic');
   }
-  if (accepted && fixture.scenario.bytes >= 16 * 1024) {
-    requireCheck(observed.stdout.includes('CI dispatch response exceeds 16384-byte logging threshold'), 'Missing response-size diagnostic');
+  if (accepted && fixture.scenario.bytes > loggingThreshold) {
+    const expectedBytes = Math.min(fixture.scenario.bytes, responseReadLimit);
+    requireCheck(observed.stdout.includes(`CI dispatch response exceeds ${loggingThreshold}-byte logging threshold (${expectedBytes} bytes read)`), 'Missing or incorrect response-size diagnostic');
   }
   if (accepted) {
     requireCheck(observed.stdout.includes(`CI server accepted dispatch: HTTP ${fixture.scenario.status}`),
