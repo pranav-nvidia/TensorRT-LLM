@@ -13,7 +13,8 @@ const scenarios = Object.freeze({
   'http-500': {status: 500, outcome: 'refused'},
   'http-503': {status: 503, outcome: 'refused'},
   'body-at-limit': {status: 200, outcome: 'accepted', bytes: 16 * 1024},
-  'body-over-limit': {status: 200, outcome: 'oversized', bytes: 16 * 1024 + 1},
+  'body-over-limit': {status: 200, outcome: 'accepted', bytes: 16 * 1024 + 1},
+  'body-128k': {status: 200, outcome: 'accepted', bytes: 128 * 1024},
   'body-truncated': {status: 200, outcome: 'unreadable', truncated: true},
   'connection-reset': {status: null, outcome: 'request-error', reset: true},
 });
@@ -112,6 +113,9 @@ function assessDispatch(fixture, observed) {
   if (fixture.scenario.outcome === 'refused') {
     requireCheck(observed.stdout.includes(`CI server refused dispatch: HTTP ${fixture.scenario.status}`),
       'Missing numeric refusal diagnostic');
+  }
+  if (accepted && fixture.scenario.bytes >= 16 * 1024) {
+    requireCheck(observed.stdout.includes('CI dispatch response exceeds 16384-byte logging threshold'), 'Missing response-size diagnostic');
   }
   if (accepted) {
     requireCheck(observed.stdout.includes(`CI server accepted dispatch: HTTP ${fixture.scenario.status}`),

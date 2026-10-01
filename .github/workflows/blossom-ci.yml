@@ -1,10 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-name: Blossom pass 2 HTTP validation
+name: Blossom HTTP runner validation
 on:
-  pull_request:
-    types: [opened, synchronize]
-    paths: [.github/workflows/blossom-ci.yml, .github/blossom-pass2/**]
+  workflow_dispatch:
+    inputs:
+      fixture:
+        type: choice
+        default: http-200
+        options: [http-200, http-204, http-299, http-302, http-403, http-503, body-at-limit, body-over-limit, body-128k]
+      pr:
+        description: 'Open, mergeable fixture PR number'
+        type: string
+        required: true
 permissions:
   contents: read
   actions: read
@@ -12,7 +19,8 @@ permissions:
   pull-requests: write
   statuses: write
 env:
-  FIXTURE_NAME: http-503
+  FIXTURE_NAME: ${{ inputs.fixture || 'http-503' }}
+  PROBE_PR: ${{ inputs.pr || github.event.pull_request.number }}
 jobs:
   Authorization:
     name: Authorization
@@ -21,8 +29,10 @@ jobs:
     timeout-minutes: 10
     outputs:
       args: ${{ env.args }}
+      head-sha: ${{ steps.auth.outputs.head-sha }}
     steps:
       - name: Authorize synthetic command with actual deployed Blossom
+        id: auth
         uses: actions/github-script@v7
         env:
           REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -33,7 +43,8 @@ jobs:
             const os = require('node:os');
             const path = require('node:path');
             const cp = require('node:child_process');
-            const pr = context.payload.pull_request;
+            const {data: pr} = await github.rest.pulls.get({...context.repo, pull_number: Number(process.env.PROBE_PR)});
+            core.setOutput('head-sha', pr.head.sha);
             const {data: marker} = await github.rest.issues.createComment({...context.repo, issue_number: pr.number,
               body: `Pass 2 ${process.env.FIXTURE_NAME}: authorize synthetic /bot run, perform a fresh real scan, then test the deployed binary against a controlled HTTP response.`});
             const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'blossom-pass2-auth-'));
@@ -69,7 +80,7 @@ jobs:
           args3: ${{ fromJson(needs.Authorization.outputs.args).args3 }}
   Job-trigger:
     name: Controlled HTTP verdict
-    needs: [Vulnerability-scan]
+    needs: [Authorization, Vulnerability-scan]
     runs-on: blossom
     timeout-minutes: 10
     steps:
@@ -77,19 +88,21 @@ jobs:
         uses: actions/github-script@v7
         env:
           PROBE_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED_HEAD_SHA: ${{ needs.Authorization.outputs.head-sha }}
         with:
           script: |
             const fs = require('node:fs');
             const os = require('node:os');
             const path = require('node:path');
             const dir = fs.mkdtempSync(path.join(os.tmpdir(),'blossom-pass2-code-'));
+            const {data: pr} = await github.rest.pulls.get({...context.repo, pull_number: Number(process.env.PROBE_PR)});
             try {
               for (const name of ['webhook-fixture.cjs','run-dispatch-probe.cjs']) {
                 const {data} = await github.rest.repos.getContent({...context.repo,
-                  path:'.github/blossom-pass2/'+name,ref:context.payload.pull_request.head.sha});
+                  path:'.github/blossom-pass2/'+name,ref:context.sha});
                 fs.writeFileSync(path.join(dir,name),Buffer.from(data.content,'base64'));
               }
               const {runDispatchProbe} = require(path.join(dir,'run-dispatch-probe.cjs'));
               await runDispatchProbe({github,context,core,fixtureName:process.env.FIXTURE_NAME,
-                prNumber:context.payload.pull_request.number,expectedPrHeadSha:context.payload.pull_request.head.sha});
+                prNumber:pr.number,expectedPrHeadSha:process.env.EXPECTED_HEAD_SHA});
             } finally { fs.rmSync(dir,{recursive:true,force:true}); }
