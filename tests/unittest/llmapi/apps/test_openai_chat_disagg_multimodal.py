@@ -203,13 +203,24 @@ def test_generation_only_never_loads_relayed_media(route_client):
     assert "multi_modal_data" not in captured["inputs"]
 
 
-@pytest.mark.parametrize("media_kind", sorted(MEDIA_PARTS))
-def test_context_only_keeps_media(route_client, media_kind):
+def test_context_only_keeps_media(route_client):
     """The context worker is the one that expands, so it keeps its media."""
-    _, prompt_key = MEDIA_PARTS[media_kind]
-    prompt = _post(route_client, media_kind, {"request_type": "context_only"})
+    prompt = _post(route_client, "image_url", {"request_type": "context_only"})
 
-    assert prompt[prompt_key]
+    assert prompt["multi_modal_data"]
+
+
+def test_context_only_rejects_precomputed_embeddings(route_client):
+    """Disaggregated requests do not carry the embeddings' cache identity."""
+    client, captured = route_client
+    response = client.post(
+        "/v1/chat/completions",
+        json=_chat_body("image_embeds", {"request_type": "context_only"}),
+    )
+
+    assert response.status_code == 400, response.text
+    assert "not supported with disaggregated serving" in response.text
+    assert "inputs" not in captured
 
 
 @pytest.mark.parametrize("media_kind", sorted(MEDIA_PARTS))

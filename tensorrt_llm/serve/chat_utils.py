@@ -1,4 +1,5 @@
 import json
+import os
 import uuid
 from functools import lru_cache, partial
 from pathlib import Path
@@ -17,7 +18,7 @@ from typing_extensions import Required
 
 from tensorrt_llm.inputs import (ContentFormat, ConversationMessage,
                                  MultimodalData, MultimodalDataTracker,
-                                 load_base64_image_embeds)
+                                 async_load_base64_tensor)
 from tensorrt_llm.inputs.media_io import (MEDIA_IO_REGISTRY, BaseMediaIO,
                                           is_local_media_url)
 from tensorrt_llm.inputs.model_config import resolve_top_level_model_type
@@ -38,9 +39,20 @@ class ChatCompletionContentPartVideoParam(TypedDict, total=False):
     type: Required[Literal["video_url"]]
 
 
-class ImageEmbedsData(TypedDict):
+class ImageEmbedsData(TypedDict, total=False):
     """Type definition for serialized image embeddings structure."""
     data: Required[str]
+    image_grid_thw: List[int]
+
+
+class VideoEmbedsData(TypedDict, total=False):
+    """Serialized video embeddings with the grid and timing they were encoded with."""
+    data: Required[str]
+    video_grid_thw: Required[List[int]]
+    timestamps: List[float]
+    fps: float
+    frames_indices: List[int]
+    second_per_grid_ts: float
 
 
 class ChatCompletionContentPartImageEmbedsParam(TypedDict, total=False):
@@ -51,11 +63,18 @@ class ChatCompletionContentPartImageEmbedsParam(TypedDict, total=False):
     type: Required[Literal["image_embeds"]]
 
 
+class ChatCompletionContentPartVideoEmbedsParam(TypedDict, total=False):
+    """Video embeddings passed as a base64-encoded PyTorch tensor plus metadata."""
+    video_embeds: Required[VideoEmbedsData]
+    type: Required[Literal["video_embeds"]]
+
+
 # Type Aliases and Constants
 ChatCompletionContentPartParam: TypeAlias = Union[
     OpenAIChatCompletionContentPartParam,
     ChatCompletionContentPartVideoParam,
     ChatCompletionContentPartImageEmbedsParam,
+    ChatCompletionContentPartVideoEmbedsParam,
     str,
 ]
 
@@ -66,7 +85,22 @@ VALID_MESSAGE_CONTENT_MM_PART_TYPES = frozenset([
     "audio_url",
     "input_audio",
     "image_embeds",
+    "video_embeds",
 ])
+
+MM_EMBEDS_MAX_BYTES_ENV = "TRTLLM_MM_EMBEDS_MAX_BYTES"
+DEFAULT_MM_EMBEDS_MAX_BYTES = 256 * 1024 * 1024
+
+# Metadata a client may send next to "data", per embeddings part type.
+_EMBEDS_METADATA_KEYS = {
+    "image_embeds":
+    frozenset({"image_grid_thw"}),
+    "video_embeds":
+    frozenset({
+        "video_grid_thw", "timestamps", "fps", "frames_indices",
+        "second_per_grid_ts"
+    }),
+}
 
 # Parser Functions
 _TextParser = partial(cast, ChatCompletionContentPartTextParam)
@@ -88,9 +122,60 @@ MM_PARSER_MAP: dict[str, Callable[[ChatCompletionContentPartParam], Union[
         "input_audio":
         lambda part: cast(dict, part).get("input_audio", None),
         "image_embeds":
-        lambda part: _ImageEmbedsParser(part).get("image_embeds", {}).get(
-            "data", None),
+        lambda part: cast(dict, part).get("image_embeds", None),
+        "video_embeds":
+        lambda part: cast(dict, part).get("video_embeds", None),
     }
+
+
+def mm_embeds_max_bytes() -> int:
+    """Return the per-request limit on decoded image/video embedding bytes."""
+    value = os.environ.get(MM_EMBEDS_MAX_BYTES_ENV)
+    if value is None:
+        return DEFAULT_MM_EMBEDS_MAX_BYTES
+    limit = int(value)
+    if limit <= 0:
+        raise ValueError(
+            f"{MM_EMBEDS_MAX_BYTES_ENV} must be positive, got {value!r}")
+    return limit
+
+
+def _parse_embeds_part(
+        part_type: str, content: Any,
+        mm_data_tracker: MultimodalDataTracker) -> Coroutine[Any, Any, Any]:
+    """Validate an embeddings part and return the coroutine that decodes it.
+
+    The base64 length of every embeddings part in the request is charged
+    against `mm_embeds_max_bytes()` before anything is decoded; decoding runs
+    off the event loop. A part with metadata yields the item dict that
+    `parse_external_embeddings` takes, a bare image part yields the tensor.
+    """
+    if not isinstance(content, dict):
+        raise ValueError(
+            f"'{part_type}' must be an object with a 'data' field.")
+    data = content.get("data")
+    if not isinstance(data, str) or not data:
+        raise ValueError(
+            f"'{part_type}' requires a non-empty base64 'data' string.")
+    metadata = {key: value for key, value in content.items() if key != "data"}
+    unknown = set(metadata) - _EMBEDS_METADATA_KEYS[part_type]
+    if unknown:
+        raise ValueError(
+            f"Unsupported '{part_type}' fields: {sorted(unknown)}; "
+            f"allowed: {sorted(_EMBEDS_METADATA_KEYS[part_type])}.")
+    max_bytes = mm_embeds_max_bytes()
+    mm_data_tracker.charge_embedding_payload(len(data), max_bytes)
+
+    async def decode() -> Any:
+        tensor = await async_load_base64_tensor(data, max_bytes=max_bytes)
+        if not tensor.is_floating_point():
+            raise ValueError(f"'{part_type}' must hold a floating-point "
+                             f"tensor, got {tensor.dtype}.")
+        if not metadata:
+            return tensor
+        return {"embedding": tensor, **metadata}
+
+    return decode()
 
 
 def _make_media_io(
@@ -171,14 +256,10 @@ def parse_chat_message_content_part(
                               data=_load_request_media(image_io, str_content),
                               is_embedding=False)
 
-    if part_type == "image_embeds":
-        str_content = cast(str, content)
-
-        async def decode_image_embeds():
-            return load_base64_image_embeds(str_content)
-
-        return MultimodalData(modality="image",
-                              data=decode_image_embeds(),
+    if part_type in ("image_embeds", "video_embeds"):
+        return MultimodalData(modality=part_type.removesuffix("_embeds"),
+                              data=_parse_embeds_part(part_type, content,
+                                                      mm_data_tracker),
                               is_embedding=True)
 
     if part_type == "video_url":

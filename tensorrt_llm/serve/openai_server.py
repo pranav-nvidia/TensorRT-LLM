@@ -2597,6 +2597,10 @@ class OpenAIServer(_VideoRoutesMixin):
             if mm_data:
                 self._attach_multimodal_data(prompt, request, mm_data,
                                              mm_item_order)
+            if mm_embeddings and request.disaggregated_params is not None:
+                raise ValueError(
+                    "image_embeds/video_embeds are not supported with "
+                    "disaggregated serving.")
             if mm_embeddings:
                 prompt["multi_modal_embeddings"] = mm_embeddings
             if mm_data and mm_embeddings:

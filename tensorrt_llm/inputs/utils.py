@@ -529,6 +529,8 @@ class MultimodalDataTracker:
         # `add_data` (skipping `is_embedding=True` items — the interleave
         # manifest addresses raw payload only).
         self._item_order: list[dict[str, Union[str, int]]] = []
+        # Base64 characters of the request's embeddings parts so far.
+        self._embedding_payload_chars = 0
         self._multimodal_server_config = multimodal_server_config if multimodal_server_config is not None else MultimodalServerConfig(
         )
         # Per-request override merged with the server default at media-load
@@ -611,6 +613,19 @@ class MultimodalDataTracker:
             }
 
         return _retrieve(self._data), _retrieve(self._embeddings)
+
+    def charge_embedding_payload(self, num_chars: int, max_bytes: int) -> None:
+        """Charge a base64 embeddings payload against the request's byte limit.
+
+        Raises `ValueError` once the request's payloads together could decode
+        to more than `max_bytes`, before any of them is decoded.
+        """
+        self._embedding_payload_chars += num_chars
+        max_chars = 4 * ((max_bytes + 2) // 3)
+        if self._embedding_payload_chars > max_chars:
+            raise ValueError(
+                f"Embedding payloads in this request exceed the {max_bytes}-"
+                "byte limit.")
 
     def add_data(self,
                  media_type: str,

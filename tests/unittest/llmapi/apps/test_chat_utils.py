@@ -1178,3 +1178,115 @@ class TestRequestLocalMediaPaths:
         with pytest.raises(ValueError, match="Local media paths are not accepted") as excinfo:
             await self._load(str(media_dirs[0] / "img.png"))
         assert str(missing) not in str(excinfo.value)
+
+
+def _b64_tensor(tensor) -> str:
+    import base64
+    import io
+
+    import torch
+
+    buffer = io.BytesIO()
+    torch.save(tensor, buffer)
+    return base64.b64encode(buffer.getvalue()).decode()
+
+
+class TestEmbedsParts:
+    """image_embeds / video_embeds parts: metadata, validation and byte limits."""
+
+    @pytest.fixture
+    def mm_tracker(self):
+        return MultimodalDataTracker(model_type="dummy")
+
+    @pytest.mark.asyncio
+    async def test_video_embeds_carry_grid_and_timing(self, mm_tracker):
+        import torch
+
+        embedding = torch.randn(8, 4, dtype=torch.bfloat16)
+        part = {
+            "type": "video_embeds",
+            "video_embeds": {
+                "data": _b64_tensor(embedding),
+                "video_grid_thw": [2, 4, 4],
+                "fps": 2.0,
+                "frames_indices": [0, 1, 2, 3],
+            },
+        }
+        result = parse_chat_message_content_part(part, mm_tracker)
+        assert result["modality"] == "video" and result["is_embedding"]
+        item = await result["data"]
+        assert torch.equal(item.pop("embedding"), embedding)
+        assert item == {"video_grid_thw": [2, 4, 4], "fps": 2.0, "frames_indices": [0, 1, 2, 3]}
+
+    @pytest.mark.asyncio
+    async def test_image_embeds_grid_is_optional(self, mm_tracker):
+        import torch
+
+        embedding = torch.randn(4, 4)
+        bare = parse_chat_message_content_part(
+            {"type": "image_embeds", "image_embeds": {"data": _b64_tensor(embedding)}}, mm_tracker
+        )
+        assert torch.equal(await bare["data"], embedding)
+        gridded = parse_chat_message_content_part(
+            {
+                "type": "image_embeds",
+                "image_embeds": {"data": _b64_tensor(embedding), "image_grid_thw": [1, 4, 4]},
+            },
+            mm_tracker,
+        )
+        assert (await gridded["data"])["image_grid_thw"] == [1, 4, 4]
+
+    @pytest.mark.parametrize(
+        ("part", "match"),
+        [
+            (
+                {"type": "video_embeds", "video_embeds": {"data": "AA==", "pixel_values": 1}},
+                "Unsupported",
+            ),
+            ({"type": "image_embeds", "image_embeds": {"data": "AA==", "fps": 1.0}}, "Unsupported"),
+            ({"type": "video_embeds", "video_embeds": {"data": 3}}, "base64 'data'"),
+            ({"type": "video_embeds", "video_embeds": "AA=="}, "must be an object"),
+        ],
+    )
+    def test_malformed_parts_are_rejected_before_decode(self, mm_tracker, part, match):
+        with pytest.raises(ValueError, match=match):
+            parse_chat_message_content_part(part, mm_tracker)
+
+    @pytest.mark.asyncio
+    async def test_integer_embeddings_are_rejected(self, mm_tracker):
+        import torch
+
+        result = parse_chat_message_content_part(
+            {
+                "type": "image_embeds",
+                "image_embeds": {"data": _b64_tensor(torch.ones(2, 2, dtype=torch.int32))},
+            },
+            mm_tracker,
+        )
+        with pytest.raises(ValueError, match="floating-point"):
+            await result["data"]
+
+    @pytest.mark.asyncio
+    async def test_payload_that_is_not_a_tensor_is_rejected(self, mm_tracker):
+        import torch
+
+        result = parse_chat_message_content_part(
+            {"type": "image_embeds", "image_embeds": {"data": _b64_tensor({"x": torch.ones(1)})}},
+            mm_tracker,
+        )
+        with pytest.raises(TypeError, match="single tensor"):
+            await result["data"]
+
+    def test_request_byte_limit_spans_parts(self, mm_tracker, monkeypatch):
+        import torch
+
+        data = _b64_tensor(torch.zeros(16, 16))
+        decoded_bytes = len(data) * 3 // 4
+        monkeypatch.setenv(
+            _chat_utils.MM_EMBEDS_MAX_BYTES_ENV, str(decoded_bytes + decoded_bytes // 2)
+        )
+        part = {"type": "image_embeds", "image_embeds": {"data": data}}
+        first = parse_chat_message_content_part(part, mm_tracker)
+        first["data"].close()
+        with pytest.raises(ValueError, match="exceed the"):
+            parse_chat_message_content_part(part, mm_tracker)

@@ -1686,6 +1686,9 @@ async def _create_input_tokens(
         if mm_item_order:
             inputs["mm_item_order"] = mm_item_order
     if mm_embeddings:
+        if request.disaggregated_params is not None:
+            raise ValueError("image_embeds/video_embeds are not supported "
+                             "with disaggregated serving.")
         inputs["multi_modal_embeddings"] = mm_embeddings
     return inputs
 
