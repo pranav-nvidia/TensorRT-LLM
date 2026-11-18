@@ -1263,7 +1263,7 @@ class TestEmbedsParts:
             },
             mm_tracker,
         )
-        with pytest.raises(ValueError, match="floating-point"):
+        with pytest.raises(ValueError, match="unsupported dtype"):
             await result["data"]
 
     @pytest.mark.asyncio
@@ -1274,7 +1274,7 @@ class TestEmbedsParts:
             {"type": "image_embeds", "image_embeds": {"data": _b64_tensor({"x": torch.ones(1)})}},
             mm_tracker,
         )
-        with pytest.raises(TypeError, match="single tensor"):
+        with pytest.raises(ValueError, match="unsupported pickle opcode"):
             await result["data"]
 
     def test_request_byte_limit_spans_parts(self, mm_tracker, monkeypatch):

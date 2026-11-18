@@ -168,9 +168,6 @@ def _parse_embeds_part(
 
     async def decode() -> Any:
         tensor = await async_load_base64_tensor(data, max_bytes=max_bytes)
-        if not tensor.is_floating_point():
-            raise ValueError(f"'{part_type}' must hold a floating-point "
-                             f"tensor, got {tensor.dtype}.")
         if not metadata:
             return tensor
         return {"embedding": tensor, **metadata}
