@@ -91,7 +91,7 @@ from tensorrt_llm.serve.anthropic_protocol import (AnthropicBatchDeleteResponse,
                                                    AnthropicCreateBatchRequest,
                                                    AnthropicMessagesRequest)
 from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
-from tensorrt_llm.serve.chat_utils import (load_chat_template,
+from tensorrt_llm.serve.chat_utils import (has_embeds_parts, load_chat_template,
                                            parse_chat_messages_coroutines)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.conversation_id import (get_request_conversation_id,
@@ -2514,6 +2514,11 @@ class OpenAIServer(_VideoRoutesMixin):
             self._validate_internal_disagg_request(request, raw_request)
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
+            if (request.disaggregated_params is not None
+                    and has_embeds_parts(request.messages)):
+                raise ValueError(
+                    "image_embeds/video_embeds are not supported with "
+                    "disaggregated serving.")
 
             # A generation-only worker already has prompt_token_ids with the
             # placeholders expanded and the KV behind them over the
@@ -2597,10 +2602,6 @@ class OpenAIServer(_VideoRoutesMixin):
             if mm_data:
                 self._attach_multimodal_data(prompt, request, mm_data,
                                              mm_item_order)
-            if mm_embeddings and request.disaggregated_params is not None:
-                raise ValueError(
-                    "image_embeds/video_embeds are not supported with "
-                    "disaggregated serving.")
             if mm_embeddings:
                 prompt["multi_modal_embeddings"] = mm_embeddings
             if mm_data and mm_embeddings:

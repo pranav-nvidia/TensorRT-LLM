@@ -529,8 +529,10 @@ class MultimodalDataTracker:
         # `add_data` (skipping `is_embedding=True` items — the interleave
         # manifest addresses raw payload only).
         self._item_order: list[dict[str, Union[str, int]]] = []
-        # Base64 characters of the request's embeddings parts so far.
+        # Base64 characters and decoded tensor bytes of the request's
+        # embeddings parts so far.
         self._embedding_payload_chars = 0
+        self._embedding_tensor_bytes = 0
         self._multimodal_server_config = multimodal_server_config if multimodal_server_config is not None else MultimodalServerConfig(
         )
         # Per-request override merged with the server default at media-load
@@ -625,6 +627,18 @@ class MultimodalDataTracker:
         if self._embedding_payload_chars > max_chars:
             raise ValueError(
                 f"Embedding payloads in this request exceed the {max_bytes}-"
+                "byte limit.")
+
+    def charge_embedding_tensor(self, num_bytes: int, max_bytes: int) -> None:
+        """Charge a decoded embedding tensor's logical bytes to the request.
+
+        Compact archives can hold expanded views, so the request's decoded
+        tensors are bounded together as well as its payloads.
+        """
+        self._embedding_tensor_bytes += num_bytes
+        if self._embedding_tensor_bytes > max_bytes:
+            raise ValueError(
+                f"Embedding tensors in this request exceed the {max_bytes}-"
                 "byte limit.")
 
     def add_data(self,

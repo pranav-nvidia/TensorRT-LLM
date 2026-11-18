@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1290,3 +1291,31 @@ class TestEmbedsParts:
         first["data"].close()
         with pytest.raises(ValueError, match="exceed the"):
             parse_chat_message_content_part(part, mm_tracker)
+
+    @pytest.mark.asyncio
+    async def test_request_tensor_limit_spans_compact_views(self, mm_tracker, monkeypatch):
+        import torch
+
+        # Each archive holds one 8-float row; each tensor is 4096 x 8 floats.
+        data = _b64_tensor(torch.zeros(1, 8).expand(4096, 8))
+        monkeypatch.setenv(_chat_utils.MM_EMBEDS_MAX_BYTES_ENV, str(200_000))
+        part = {"type": "image_embeds", "image_embeds": {"data": data}}
+        first = parse_chat_message_content_part(part, mm_tracker)
+        second = parse_chat_message_content_part(part, mm_tracker)
+        assert (await first["data"]).shape == (4096, 8)
+        with pytest.raises(ValueError, match="Embedding tensors in this request exceed"):
+            await second["data"]
+
+
+@pytest.mark.parametrize(
+    ("messages", "expected"),
+    [
+        ([{"role": "user", "content": "hi"}], False),
+        ([{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}], False),
+        ([{"role": "user", "content": [{"type": "video_embeds", "video_embeds": {}}]}], True),
+        ([SimpleNamespace(content=[SimpleNamespace(type="image_embeds")])], True),
+        ("a plain string input", False),
+    ],
+)
+def test_has_embeds_parts(messages, expected):
+    assert _chat_utils.has_embeds_parts(messages) is expected

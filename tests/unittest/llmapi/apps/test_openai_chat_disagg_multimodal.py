@@ -172,14 +172,13 @@ def _post(route_client, media_kind: str, disaggregated_params: dict | None):
     return prompt
 
 
-@pytest.mark.parametrize("media_kind", sorted(MEDIA_PARTS))
-def test_generation_only_drops_relayed_media(route_client, media_kind):
+def test_generation_only_drops_relayed_media(route_client):
     """The generation worker gets the ids and none of the media.
 
     Both keys, not just one: `LLM._preprocess` takes its generation-only
     branch only when neither is attached.
     """
-    prompt = _post(route_client, media_kind, {"request_type": "generation_only"})
+    prompt = _post(route_client, "image_url", {"request_type": "generation_only"})
 
     assert "multi_modal_data" not in prompt
     assert "multi_modal_embeddings" not in prompt
@@ -210,13 +209,23 @@ def test_context_only_keeps_media(route_client):
     assert prompt["multi_modal_data"]
 
 
-def test_context_only_rejects_precomputed_embeddings(route_client):
-    """Disaggregated requests do not carry the embeddings' cache identity."""
+@pytest.mark.parametrize("request_type", ["context_only", "generation_only"])
+@pytest.mark.parametrize("relayed_ids_b64", [False, True])
+def test_disaggregated_requests_reject_precomputed_embeddings(
+    route_client, request_type, relayed_ids_b64
+):
+    """Disaggregated requests do not carry the embeddings' cache identity.
+
+    A generation-only worker would otherwise drop the parts unread.
+    """
     client, captured = route_client
-    response = client.post(
-        "/v1/chat/completions",
-        json=_chat_body("image_embeds", {"request_type": "context_only"}),
-    )
+    body = _chat_body("image_embeds", {"request_type": request_type})
+    if relayed_ids_b64:
+        ids = body.pop("prompt_token_ids")
+        body["prompt_token_ids_b64"] = base64.b64encode(
+            torch.tensor(ids, dtype=torch.int32).numpy().tobytes()
+        ).decode()
+    response = client.post("/v1/chat/completions", json=body)
 
     assert response.status_code == 400, response.text
     assert "not supported with disaggregated serving" in response.text
