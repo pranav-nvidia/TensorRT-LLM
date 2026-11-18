@@ -5,6 +5,7 @@
 import base64
 import io
 import os
+from types import SimpleNamespace
 from typing import Any, Dict, List
 
 import openai
@@ -85,28 +86,85 @@ def test_completion_matches_token_prompt(
     assert by_embeds.usage.prompt_tokens == len(ids)
 
 
+# In a batch, embedding and token prompts take different bf16 kernel paths
+# (measured drift up to ~0.11 over 16 steps; alone they match exactly), which
+# can also flip an exact tie between two greedy candidates.
+LOGPROB_ATOL = 0.25
+
+
+def _log_margins(reference: Any, candidate: Any) -> None:
+    """Print each position's tokens and the reference's top-2 logprob margin."""
+    for step, (ref_tok, cand_tok) in enumerate(
+        zip(reference.logprobs.tokens, candidate.logprobs.tokens)
+    ):
+        top = sorted(reference.logprobs.top_logprobs[step].values(), reverse=True)
+        margin = top[0] - top[1] if len(top) > 1 else float("inf")
+        print(f"step {step:2d} ref={ref_tok!r} cand={cand_tok!r} margin={margin:.3f}")
+
+
+def _assert_same_greedy_path(reference: Any, candidate: Any) -> None:
+    """Assert two greedy choices agree token by token, except across a near-tie.
+
+    Up to the first differing token the chosen tokens' logprobs must match; at
+    that token both picks must be near-tied in the reference distribution.
+    """
+    ref_lp, cand_lp = reference.logprobs, candidate.logprobs
+    for step, (ref_tok, cand_tok) in enumerate(zip(ref_lp.tokens, cand_lp.tokens)):
+        ref_top = ref_lp.top_logprobs[step]
+        if ref_tok != cand_tok:
+            assert cand_tok in ref_top, (step, ref_tok, cand_tok, ref_top)
+            gap = abs(ref_top[ref_tok] - ref_top[cand_tok])
+            assert gap <= LOGPROB_ATOL, (step, ref_tok, cand_tok, ref_top)
+            return
+        drift = abs(ref_lp.token_logprobs[step] - cand_lp.token_logprobs[step])
+        assert drift <= LOGPROB_ATOL, (step, ref_tok, drift)
+    assert reference.text == candidate.text
+
+
 def test_completion_batch_and_stream(
     client: openai.OpenAI, model_path: str, tokenizer: Any, embed_table: torch.Tensor
 ) -> None:
-    """Several payloads in one request, streamed, each reproduce their token prompt."""
+    """Several payloads in one request follow their token prompts; streaming serves them all."""
     texts = ["Water boils at a temperature of", "The largest planet in the solar system is"]
     id_lists = [tokenizer.encode(t, add_special_tokens=False) for t in texts]
-    # Batched the same way as the embeddings request: batch composition can
-    # change greedy tokens through kernel numerics.
-    by_ids = client.completions.create(model=model_path, prompt=id_lists, **_greedy())
-    expected = [c.text for c in sorted(by_ids.choices, key=lambda c: c.index)]
+    payloads = [_b64(embed_table[ids]) for ids in id_lists]
+    by_ids = client.completions.create(model=model_path, prompt=id_lists, logprobs=2, **_greedy())
+    by_embeds = _complete(client, model_path, prompt_embeds=payloads, logprobs=2)
+    expected = sorted(by_ids.choices, key=lambda c: c.index)
+    got = sorted(by_embeds.choices, key=lambda c: c.index)
+    assert [c.index for c in got] == [0, 1]
+    for reference, candidate in zip(expected, got):
+        _log_margins(reference, candidate)
+        _assert_same_greedy_path(reference, candidate)
+
     stream = client.completions.create(
         model=model_path,
         prompt=None,
         stream=True,
-        extra_body={"prompt_embeds": [_b64(embed_table[ids]) for ids in id_lists]},
+        logprobs=2,
+        extra_body={"prompt_embeds": payloads},
         **_greedy(),
     )
-    got = ["", ""]
+    streamed = [
+        SimpleNamespace(
+            text="",
+            logprobs=SimpleNamespace(tokens=[], token_logprobs=[], top_logprobs=[]),
+        )
+        for _ in payloads
+    ]
     for chunk in stream:
         for choice in chunk.choices:
-            got[choice.index] += choice.text
-    assert got == expected
+            out = streamed[choice.index]
+            out.text += choice.text
+            if choice.logprobs is not None:
+                out.logprobs.tokens += choice.logprobs.tokens
+                out.logprobs.token_logprobs += choice.logprobs.token_logprobs
+                out.logprobs.top_logprobs += choice.logprobs.top_logprobs
+    # Streaming must follow the same greedy path as the non-streamed request of
+    # the same batch; a split is allowed only at a near-tie (top-2 margin).
+    for reference, candidate in zip(got, streamed):
+        _log_margins(reference, candidate)
+        _assert_same_greedy_path(reference, candidate)
 
 
 def test_chat_part_matches_text(
