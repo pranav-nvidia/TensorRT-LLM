@@ -136,12 +136,17 @@ from tensorrt_llm.serve.postprocess_handlers import (
     chat_stream_post_processor, completion_response_post_processor,
     completion_stream_post_processor, responses_api_post_processor,
     responses_api_streaming_post_processor)
+from tensorrt_llm.serve.prompt_embeds import (DISABLED_MESSAGE,
+                                              decode_prompt_embeds,
+                                              model_hidden_size, pop_chat_parts,
+                                              prompt_embeds_max_bytes,
+                                              splice_chat_prompt_embeds)
 from tensorrt_llm.serve.render import (HarmonyConversionError, RenderResources,
                                        UnsupportedRenderError,
                                        mount_render_endpoints,
                                        prepare_chat_request, render_chat,
                                        render_chat_for_length,
-                                       render_conversation)
+                                       render_conversation, tokenize_rendered)
 from tensorrt_llm.serve.reranker import (Qwen3RerankInputBuilder,
                                          rerank_probability)
 from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
@@ -316,6 +321,12 @@ def _configure_parser_special_token_decoding(
         # tokens, for example ``<|open|>tools<|sep|>``. Inserting spaces here
         # changes the protocol and prevents the K3 parsers from matching it.
         sampling_params.spaces_between_special_tokens = False
+
+
+def _tokenize_segment(res: RenderResources, text: str,
+                      add_special_tokens: bool) -> List[int]:
+    """Tokenize one text segment of a rendered chat prompt."""
+    return tokenize_rendered(res, text, add_special_tokens=add_special_tokens)
 
 
 def _record_generator_termination(generator) -> None:
@@ -635,7 +646,8 @@ class OpenAIServer(_VideoRoutesMixin):
             enable_runtime_control_endpoints: bool = False,
             runtime_control_api_key: Optional[str] = None,
             multi_frontend_serving: Optional[MultiFrontendServing] = None,
-            graceful_shutdown_timeout: Optional[int] = None):
+            graceful_shutdown_timeout: Optional[int] = None,
+            enable_prompt_embeds: bool = False):
         if graceful_shutdown_timeout is not None and graceful_shutdown_timeout <= 0:
             raise ValueError(
                 "graceful_shutdown_timeout must be a positive number of "
@@ -712,6 +724,8 @@ class OpenAIServer(_VideoRoutesMixin):
             check_path_response_policy()
 
         self.allow_request_chat_template = allow_request_chat_template
+        # Clients may send tensor payloads (prompt_embeds) only when enabled.
+        self.enable_prompt_embeds = enable_prompt_embeds
         self._internal_disagg_auth_key = internal_disagg_auth_key
         self._enable_rl_control_endpoints = enable_rl_control_endpoints
         self._rl_control_api_key = rl_control_api_key
@@ -2241,6 +2255,28 @@ class OpenAIServer(_VideoRoutesMixin):
         if self._iteration_stats_buffer is not None:
             self._iteration_stats_buffer.append(llm_stat)
 
+    def _check_prompt_embeds_allowed(
+            self,
+            disaggregated_params: Optional[LlmDisaggregatedParams]) -> None:
+        """Reject a prompt_embeds request this server cannot serve."""
+        if not self.enable_prompt_embeds:
+            raise ValueError(DISABLED_MESSAGE)
+        if (disaggregated_params is not None and
+                disaggregated_params.request_type != "context_and_generation"):
+            raise ValueError(
+                "prompt_embeds is not supported with disaggregated serving.")
+
+    async def _decode_prompt_embeds(self,
+                                    payloads: List[str]) -> List[torch.Tensor]:
+        """Decode a request's prompt_embeds payloads off the event loop."""
+        decode = functools.partial(decode_prompt_embeds,
+                                   payloads,
+                                   max_bytes=prompt_embeds_max_bytes(),
+                                   hidden_size=model_hidden_size(
+                                       self.model_config))
+        return await asyncio.get_running_loop().run_in_executor(
+            self._input_proc_executor, decode)
+
     async def _run_input_processor(
         self,
         process: Callable[[], _InputProcessingResult],
@@ -2553,6 +2589,29 @@ class OpenAIServer(_VideoRoutesMixin):
                     resolve_media=resolve_media,
                 )
 
+            prompt_embeds_parts = pop_chat_parts(conversation)
+            prompt_embeds_rows = None
+            if prompt_embeds_parts:
+                try:
+                    self._check_prompt_embeds_allowed(disaggregated_params)
+                    if (request.prompt_token_ids is not None
+                            or request.prompt_token_ids_b64):
+                        raise ValueError("prompt_embeds parts cannot be "
+                                         "combined with prompt_token_ids.")
+                    if request.truncate_prompt_tokens is not None:
+                        raise ValueError("truncate_prompt_tokens is not "
+                                         "supported with prompt_embeds parts.")
+                    if any(message.get("media") for message in conversation):
+                        raise ValueError("prompt_embeds parts cannot be "
+                                         "combined with multimodal content.")
+                    prompt_embeds_rows = await self._decode_prompt_embeds(
+                        [part.data for part in prompt_embeds_parts])
+                except Exception:
+                    # The media loads were never started; close them instead
+                    # of leaving them to be reported as never awaited.
+                    mm_coroutines.close()
+                    raise
+
             # Decode base64 int32 prompt_token_ids relayed by the orchestrator.
             if request.prompt_token_ids is None and request.prompt_token_ids_b64:
                 import numpy as np
@@ -2590,6 +2649,21 @@ class OpenAIServer(_VideoRoutesMixin):
                     # resolve_prefilled_thinking() inspects what the chat
                     # template rendered, and the prefix is not part of it.
                     rendered_prompt = rendered.template_text
+                if prompt_embeds_parts:
+                    if rendered.text is None:
+                        raise ValueError(
+                            "prompt_embeds parts are not supported for models "
+                            "whose chat renderer returns token ids.")
+                    prompt = await self._run_input_processor(
+                        functools.partial(
+                            splice_chat_prompt_embeds,
+                            rendered.text,
+                            prompt_embeds_parts,
+                            prompt_embeds_rows,
+                            functools.partial(_tokenize_segment,
+                                              render_resources),
+                            request.add_special_tokens,
+                        ))
             prompt = prompt_inputs(prompt)
 
             if request.prompt_token_ids is not None:
@@ -2676,7 +2750,8 @@ class OpenAIServer(_VideoRoutesMixin):
 
             generate_inputs = prompt
             preprocess_fn = getattr(self.generator, "preprocess", None)
-            if preprocess_fn is not None:
+            # generate_async places prompt_embeds rows itself.
+            if preprocess_fn is not None and not prompt_embeds_parts:
                 preprocess = functools.partial(preprocess_fn, prompt,
                                                sampling_params,
                                                disaggregated_params)
@@ -3302,11 +3377,22 @@ class OpenAIServer(_VideoRoutesMixin):
         try:
             if isinstance(request.prompt, list) and not request.prompt:
                 return self.create_error_response("'prompt' must not be empty.")
-            if isinstance(request.prompt, str) or \
+            if request.prompt is None:
+                prompts = []
+            elif isinstance(request.prompt, str) or \
                 (isinstance(request.prompt, list) and isinstance(request.prompt[0], int)):
                 prompts = [request.prompt]
             else:
                 prompts = request.prompt
+            if request.prompt_embeds is not None:
+                self._check_prompt_embeds_allowed(
+                    to_llm_disaggregated_params(request.disaggregated_params))
+                payloads = (request.prompt_embeds if isinstance(
+                    request.prompt_embeds, list) else [request.prompt_embeds])
+                embeds_prompts = [{
+                    "prompt_embeds": rows
+                } for rows in await self._decode_prompt_embeds(payloads)]
+                prompts = embeds_prompts + list(prompts)
 
             stream_response_id = None
             stream_created = None

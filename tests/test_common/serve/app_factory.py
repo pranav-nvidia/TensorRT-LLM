@@ -110,6 +110,8 @@ class AggConfig:
     # Attached frontend of a multi-frontend server: registers the launcher
     # forwarding routes ahead of the local handlers, which they shadow.
     multi_frontend_attached: bool = False
+    enable_prompt_embeds: bool = False  # OpenAIServer(enable_prompt_embeds=...)
+    hidden_size: Optional[int] = None  # written to the fake config.json when set
 
 
 @dataclass(frozen=True)
@@ -174,7 +176,7 @@ class ServeTestEnv:
 
     # -- builders ---------------------------------------------------------
 
-    def _write_fake_checkpoint(self, model_type: str) -> Path:
+    def _write_fake_checkpoint(self, model_type: str, hidden_size: Optional[int] = None) -> Path:
         """A directory with only a config.json, so load_pretrained_config works.
 
         No tokenizer files are written: they would make AutoProcessor succeed
@@ -186,9 +188,10 @@ class ServeTestEnv:
             "llama": ["LlamaForCausalLM"],
             "gpt_oss": ["GptOssForCausalLM"],
         }[model_type]
-        (model_dir / "config.json").write_text(
-            json.dumps({"model_type": model_type, "architectures": architectures})
-        )
+        config = {"model_type": model_type, "architectures": architectures}
+        if hidden_size is not None:
+            config["hidden_size"] = hidden_size
+        (model_dir / "config.json").write_text(json.dumps(config))
         return model_dir
 
     def build_openai_server(self, config: AggConfig) -> OpenAIServer:
@@ -198,7 +201,7 @@ class ServeTestEnv:
             os.environ[name] = value
 
         args = FakeLlmArgs(
-            model=str(self._write_fake_checkpoint(config.model_type)),
+            model=str(self._write_fake_checkpoint(config.model_type, config.hidden_size)),
             return_perf_metrics=config.return_perf_metrics,
             perf_metrics_output_dir=(
                 str(self.tmp_dir / "perf") if config.perf_metrics_output_dir else None
@@ -245,6 +248,7 @@ class ServeTestEnv:
             enable_runtime_control_endpoints=config.runtime_control,
             runtime_control_api_key="test-key" if config.runtime_control else None,
             multi_frontend_serving=multi_frontend_serving,
+            enable_prompt_embeds=config.enable_prompt_embeds,
         )
         self._servers.append(server)
         return server
