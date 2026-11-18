@@ -367,11 +367,11 @@ def render_chat(
     ignore the media, and so do messages the request model rejects unless the
     caller passes the raw body's ``raw_messages`` (see :func:`_parse_text_conversation`).
     """
-    if request.prompt_token_ids is not None:
-        return RenderedPrompt(token_ids=list(request.prompt_token_ids))
-    if has_prompt_embeds_parts(request.messages):
+    if has_prompt_embeds_parts(request.messages) or has_prompt_embeds_parts(raw_messages):
         # The parts' rows replace their marker text only on the chat route.
         raise UnsupportedRenderError("prompt_embeds parts are not supported by prompt rendering.")
+    if request.prompt_token_ids is not None:
+        return RenderedPrompt(token_ids=list(request.prompt_token_ids))
     prepared = prepare_chat_request(request, res)
 
     if res.use_harmony:

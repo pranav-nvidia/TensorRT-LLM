@@ -4,10 +4,12 @@
 
 The chat template renders each part as its marker. Here the text between
 markers is tokenized segment by segment and each marker becomes one placeholder
-id per row of its part, with a mask selecting those positions.
+id per row of its part, with a mask selecting those positions. Text after a part
+is tokenized as a continuation, so tokenizers that normalize the start of a
+string (SentencePiece adds a leading space token) do not change it.
 """
 
-from typing import Any, Callable, Dict, List, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -18,9 +20,13 @@ from .prompt_types import UnsupportedRenderError
 from .resources import RenderResources
 
 Tokenize = Callable[[str, bool], List[int]]
+Continue = Callable[[str], Optional[List[int]]]
 
 # Probe text for finding the special tokens a tokenizer wraps a prompt in.
 _PROBE = "a"
+# Text put before a continuation segment and then cut off by offsets; the
+# first that does not merge with the segment's first token is used.
+_CONTINUATION_PROBES = ("a", ".", ",")
 
 
 def resource_tokenizer(res: RenderResources) -> Tokenize:
@@ -31,6 +37,32 @@ def resource_tokenizer(res: RenderResources) -> Tokenize:
         return tokenize_rendered(res, text, add_special_tokens=add_special_tokens)
 
     return tokenize
+
+
+def resource_continuation(res: RenderResources) -> Optional[Continue]:
+    """Return ``continuation(text)``: ids of ``text`` as it reads mid-prompt.
+
+    Uses offset mapping of a fast Hugging Face tokenizer; returns None when the
+    tokenizer has none, and segments are then tokenized on their own.
+    """
+    hf_tokenizer = getattr(res.tokenizer, "tokenizer", res.tokenizer)
+    if not getattr(hf_tokenizer, "is_fast", False):
+        return None
+
+    def continuation(text: str) -> Optional[List[int]]:
+        """Tokenize ``text`` after a probe and keep the tokens past the probe."""
+        for probe in _CONTINUATION_PROBES:
+            encoded = hf_tokenizer(
+                probe + text, add_special_tokens=False, return_offsets_mapping=True
+            )
+            cut = len(probe)
+            offsets = encoded["offset_mapping"]
+            if any(start < cut < end for start, end in offsets):
+                continue  # the probe merged into the text's first token
+            return [i for i, (start, _) in zip(encoded["input_ids"], offsets) if start >= cut]
+        return None
+
+    return continuation
 
 
 def _special_token_wrap(tokenize: Tokenize) -> Tuple[List[int], List[int]]:
@@ -55,6 +87,7 @@ def splice_chat_prompt_embeds(
     rows: Sequence[torch.Tensor],
     tokenize: Tokenize,
     add_special_tokens: bool,
+    continuation: Optional[Continue] = None,
 ) -> Dict[str, Any]:
     """Turn a rendered chat prompt with part markers into an embeddings prompt.
 
@@ -66,6 +99,8 @@ def splice_chat_prompt_embeds(
             tokenizer.
         add_special_tokens: Whether the whole prompt gets the tokenizer's
             special tokens (e.g. BOS, EOS), placed once around it.
+        continuation: Tokenizes text that follows a part as it reads
+            mid-prompt; without it such text is tokenized on its own.
 
     Returns:
         ``prompt_token_ids``, ``prompt_embeds`` (the parts' rows in prompt
@@ -90,20 +125,23 @@ def splice_chat_prompt_embeds(
     token_ids: List[int] = []
     mask: List[bool] = []
 
-    def add_text(segment: str) -> None:
+    def add_text(segment: str, after_part: bool) -> None:
         """Append the ids of one text segment."""
-        if segment:
+        if not segment:
+            return
+        ids = continuation(segment) if after_part and continuation is not None else None
+        if ids is None:
             ids = tokenize(segment, False)
-            token_ids.extend(ids)
-            mask.extend([False] * len(ids))
+        token_ids.extend(ids)
+        mask.extend([False] * len(ids))
 
     cursor = 0
     for offset, marker, part_rows in placed:
-        add_text(text[cursor:offset])
+        add_text(text[cursor:offset], after_part=cursor > 0)
         token_ids.extend([PLACEHOLDER_TOKEN_ID] * part_rows.shape[0])
         mask.extend([True] * part_rows.shape[0])
         cursor = offset + len(marker)
-    add_text(text[cursor:])
+    add_text(text[cursor:], after_part=True)
     if add_special_tokens:
         prefix, suffix = _special_token_wrap(tokenize)
         token_ids = prefix + token_ids + suffix

@@ -37,7 +37,7 @@ from .fingerprint import (
     fingerprints_match,
     worker_resolves_thinking,
 )
-from .prompt_embeds import resource_tokenizer, splice_chat_prompt_embeds
+from .prompt_embeds import resource_continuation, resource_tokenizer, splice_chat_prompt_embeds
 from .prompt_types import (
     RENDERED_REQUEST_SCHEMA_VERSION,
     HarmonyConversionError,
@@ -75,6 +75,7 @@ __all__ = [
     "render_chat_for_length",
     "render_conversation",
     "render_endpoints_enabled",
+    "resource_continuation",
     "resource_tokenizer",
     "splice_chat_prompt_embeds",
     "tokenize_rendered",

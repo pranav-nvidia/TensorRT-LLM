@@ -147,7 +147,9 @@ from tensorrt_llm.serve.render import (HarmonyConversionError, RenderResources,
                                        mount_render_endpoints,
                                        prepare_chat_request, render_chat,
                                        render_chat_for_length,
-                                       render_conversation, resource_tokenizer,
+                                       render_conversation,
+                                       resource_continuation,
+                                       resource_tokenizer,
                                        splice_chat_prompt_embeds)
 from tensorrt_llm.serve.reranker import (Qwen3RerankInputBuilder,
                                          rerank_probability)
@@ -325,6 +327,25 @@ def _configure_parser_special_token_decoding(
         sampling_params.spaces_between_special_tokens = False
 
 
+async def _raw_body_has_prompt_embeds(raw_request: Optional[Request]) -> bool:
+    """Whether the raw chat body carries a prompt_embeds part.
+
+    Validated messages can hide content behind a single-pass iterator (e.g. a
+    tool message with ``tool_call_id``), so the raw JSON is checked as well;
+    it is parsed only when the bytes mention the part type.
+    """
+    if raw_request is None:
+        return False
+    body = await raw_request.body()
+    if b'"prompt_embeds"' not in body:
+        return False
+    try:
+        messages = json.loads(body).get("messages")
+    except (ValueError, AttributeError):
+        return False
+    return has_prompt_embeds_parts(messages)
+
+
 def _snapshot_embeds_prompt(prompt: Dict[str, Any]) -> Dict[str, Any]:
     """Validate a prompt_embeds prompt and take the engine's owned snapshot.
 
@@ -352,8 +373,12 @@ def _prepare_chat_embeds(text: str, parts: List[Any],
                          add_special_tokens: bool) -> Dict[str, Any]:
     """Place chat prompt_embeds parts and snapshot the prompt; blocking."""
     return _snapshot_embeds_prompt(
-        splice_chat_prompt_embeds(text, parts, payload_rows,
-                                  resource_tokenizer(res), add_special_tokens))
+        splice_chat_prompt_embeds(text,
+                                  parts,
+                                  payload_rows,
+                                  resource_tokenizer(res),
+                                  add_special_tokens,
+                                  continuation=resource_continuation(res)))
 
 
 def _record_generator_termination(generator) -> None:
@@ -3576,7 +3601,9 @@ class OpenAIServer(_VideoRoutesMixin):
 
         input_started = _start_input_processing()
         try:
-            if has_prompt_embeds_parts(request.messages):
+            if has_prompt_embeds_parts(
+                    request.messages) or await _raw_body_has_prompt_embeds(
+                        raw_request):
                 # Harmony renders messages itself and would drop the part.
                 return self.create_error_response(
                     "prompt_embeds parts are not supported for harmony models.")

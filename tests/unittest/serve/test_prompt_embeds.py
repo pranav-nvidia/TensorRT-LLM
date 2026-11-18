@@ -4,10 +4,12 @@
 
 import base64
 import io
+from types import SimpleNamespace
 from typing import Any, Dict, Iterator, List
 
 import pytest
 import torch
+from test_common.llm_data import llm_models_root
 from test_common.serve.app_factory import AggConfig, ServeTestEnv, isolated_serve_env
 
 from tensorrt_llm.inputs.prompt_embeds import PromptEmbeds
@@ -19,7 +21,7 @@ from tensorrt_llm.serve.prompt_embeds import (
     model_hidden_size,
 )
 from tensorrt_llm.serve.render.chat import render_chat
-from tensorrt_llm.serve.render.prompt_embeds import splice_chat_prompt_embeds
+from tensorrt_llm.serve.render.prompt_embeds import resource_continuation, splice_chat_prompt_embeds
 from tensorrt_llm.serve.render.prompt_types import UnsupportedRenderError
 from tensorrt_llm.serve.render.resources import RenderResources
 
@@ -265,6 +267,14 @@ def test_render_chat_refuses_parts(serve_env: ServeTestEnv) -> None:
         )
         with pytest.raises(UnsupportedRenderError, match="prompt_embeds"):
             render_chat(request, RenderResources.from_server(server))
+        # The prompt_token_ids fast path refuses them too, as inference does.
+        request = ChatCompletionRequest(
+            model="fake-model",
+            messages=[{"role": "user", "content": [_part(torch.zeros(2, HIDDEN))]}],
+            prompt_token_ids=[1, 2],
+        )
+        with pytest.raises(UnsupportedRenderError, match="prompt_embeds"):
+            render_chat(request, RenderResources.from_server(server))
 
 
 def test_parts_need_opt_in() -> None:
@@ -292,6 +302,67 @@ def test_harmony_refuses_parts(serve_env: ServeTestEnv) -> None:
                 RenderResources.from_server(server),
             )
     assert server.generator.generate_calls == []
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_harmony_refuses_parts_in_tool_messages(serve_env: ServeTestEnv, enabled: bool) -> None:
+    """A tool message with tool_call_id validates its content lazily; it is still refused."""
+    server = serve_env.build_openai_server(
+        AggConfig(model_type="gpt_oss", enable_prompt_embeds=enabled)
+    )
+    messages = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": [_part(torch.zeros(2, 4))]},
+    ]
+    with serve_env.client(server.app) as client:
+        response = _chat(client, messages)
+    assert response.status_code == 400
+    assert "prompt_embeds" in response.json()["message"]
+    assert server.generator.generate_calls == []
+
+
+def _sentencepiece_tokenizer() -> Any:
+    """TinyLlama's SentencePiece tokenizer, or skip when the model is absent."""
+    from transformers import AutoTokenizer
+
+    root = llm_models_root()
+    path = None if root is None else root / "llama-models-v2" / "TinyLlama-1.1B-Chat-v1.0"
+    if path is None or not path.exists():
+        pytest.skip("TinyLlama tokenizer not available")
+    return AutoTokenizer.from_pretrained(str(path))
+
+
+def test_splice_text_after_part_reads_as_continuation() -> None:
+    """SentencePiece would add a leading-space token to text after a part; it must not."""
+    hf = _sentencepiece_tokenizer()
+    res = SimpleNamespace(tokenizer=hf)
+
+    def tokenize(text: str, add_special_tokens: bool) -> List[int]:
+        return hf.encode(text, add_special_tokens=add_special_tokens)
+
+    part = ChatPromptEmbedsPart(marker="<M>", data="")
+    out = splice_chat_prompt_embeds(
+        "A<M>\nok</s> fine",
+        [part],
+        [torch.zeros(1, 4)],
+        tokenize,
+        False,
+        continuation=resource_continuation(res),
+    )
+    # The ids the text would have had with one token in the part's place.
+    in_context = hf.encode("AX\nok</s> fine", add_special_tokens=False)
+    head = hf.encode("A", add_special_tokens=False)
+    assert out["prompt_token_ids"] == head + [0] + in_context[len(head) + 1 :]
+    assert in_context[len(head)] == hf.convert_tokens_to_ids("X")
+    # Tokenized on its own, the tail starts with an extra space token.
+    assert hf.encode("\nok</s> fine", add_special_tokens=False) != in_context[len(head) + 1 :]
 
 
 def _identity_tokenize(text: str, add_special_tokens: bool) -> List[int]:
