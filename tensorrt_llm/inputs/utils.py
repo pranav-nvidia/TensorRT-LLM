@@ -3,6 +3,8 @@
 
 import asyncio
 import base64
+import binascii
+import zipfile
 from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
@@ -66,6 +68,80 @@ def load_base64_image_embeds(str_content: str) -> torch.Tensor:
                                               weights_only=True,
                                               map_location="cpu")
     return image_data
+
+
+def _check_tensor_archive(content: bytes, max_bytes: int) -> None:
+    """Reject a ``torch.save`` payload that could allocate more than it carries.
+
+    Only the zip format is accepted and every member must be stored
+    uncompressed, so what ``torch.load`` allocates is bounded by the payload
+    size rather than by sizes the payload declares.
+    """
+    try:
+        with zipfile.ZipFile(BytesIO(content)) as archive:
+            members = archive.infolist()
+    except zipfile.BadZipFile as e:
+        raise ValueError(
+            "Tensor payload must be a torch.save zip archive.") from e
+    total = 0
+    for member in members:
+        if member.compress_type != zipfile.ZIP_STORED:
+            raise ValueError("Tensor payload members must be uncompressed.")
+        total += member.file_size
+    if total > max_bytes:
+        raise ValueError(f"Tensor payload expands to {total} bytes, over the "
+                         f"{max_bytes}-byte limit.")
+
+
+def load_base64_tensor(data: str, *, max_bytes: int) -> torch.Tensor:
+    """Decode one dense tensor from base64-encoded ``torch.save`` bytes.
+
+    The encoded length is checked before decoding and the archive before
+    loading, so nothing allocated here exceeds ``max_bytes``. Loading uses
+    ``weights_only=True`` and maps storages to CPU. Callers check dtype and
+    shape.
+
+    Args:
+        data: Standard base64 text (no line breaks) of a ``torch.save`` file.
+        max_bytes: Upper bound on the decoded payload size.
+
+    Returns:
+        The decoded tensor on CPU.
+    """
+    if not isinstance(data, str):
+        raise TypeError(f"Tensor payload must be a base64 string, got "
+                        f"{type(data).__name__}.")
+    if len(data) > 4 * ((max_bytes + 2) // 3):
+        raise ValueError(
+            f"Tensor payload is {len(data)} base64 characters, over the "
+            f"{max_bytes}-byte limit.")
+    try:
+        content = base64.b64decode(data, validate=True)
+    except binascii.Error as e:
+        raise ValueError(f"Tensor payload is not valid base64: {e}") from e
+    if len(content) > max_bytes:
+        raise ValueError(f"Tensor payload is {len(content)} bytes, over the "
+                         f"{max_bytes}-byte limit.")
+    _check_tensor_archive(content, max_bytes)
+    try:
+        with BytesIO(content) as buf:
+            value = torch.load(buf, weights_only=True, map_location="cpu")
+    except Exception as e:
+        raise ValueError(f"Tensor payload could not be loaded: {e}") from e
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"Tensor payload must hold a single tensor, got "
+                        f"{type(value).__name__}.")
+    if value.layout != torch.strided or value.is_quantized or value.is_nested:
+        raise TypeError("Tensor payload must be a dense strided tensor.")
+    return value
+
+
+async def async_load_base64_tensor(data: str, *,
+                                   max_bytes: int) -> torch.Tensor:
+    """Run :func:`load_base64_tensor` in a worker thread, off the event loop."""
+    return await asyncio.to_thread(load_base64_tensor,
+                                   data,
+                                   max_bytes=max_bytes)
 
 
 def load_image(image: Union[str, Image.Image],
