@@ -45,7 +45,7 @@ from tensorrt_llm.inputs.utils import (
 )
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
-from tensorrt_llm.serve.prompt_embeds import PROMPT_EMBEDS_PART_TYPE
+from tensorrt_llm.serve.prompt_embeds import has_prompt_embeds_parts
 from tensorrt_llm.serve.serving_extensions import ServingExtension
 
 from .prompt_types import (
@@ -292,18 +292,6 @@ def _has_media(messages: Any) -> bool:
     return False
 
 
-def _has_prompt_embeds(messages: Any) -> bool:
-    """Whether any message carries a ``prompt_embeds`` content part."""
-    for message in messages or []:
-        content = message.get("content") if isinstance(message, dict) else None
-        if isinstance(content, list) and any(
-            isinstance(part, dict) and part.get("type") == PROMPT_EMBEDS_PART_TYPE
-            for part in content
-        ):
-            return True
-    return False
-
-
 def _parse_text_conversation(
     request: "ChatCompletionRequest",
     res: RenderResources,
@@ -381,6 +369,9 @@ def render_chat(
     """
     if request.prompt_token_ids is not None:
         return RenderedPrompt(token_ids=list(request.prompt_token_ids))
+    if has_prompt_embeds_parts(request.messages):
+        # The parts' rows replace their marker text only on the chat route.
+        raise UnsupportedRenderError("prompt_embeds parts are not supported by prompt rendering.")
     prepared = prepare_chat_request(request, res)
 
     if res.use_harmony:
@@ -397,9 +388,6 @@ def render_chat(
 
     if _has_media(request.messages):
         raise UnsupportedRenderError("Multimodal input is not supported by prompt rendering.")
-    if _has_prompt_embeds(request.messages):
-        # The prompt's rows replace its marker text only on the chat route.
-        raise UnsupportedRenderError("prompt_embeds parts are not supported by prompt rendering.")
     if _is_passthrough_model(res):
         # The model's own processor builds the prompt; the text the chat route
         # derives here is only its input, not the executed prompt.

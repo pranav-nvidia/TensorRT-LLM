@@ -10,14 +10,16 @@ import pytest
 import torch
 from test_common.serve.app_factory import AggConfig, ServeTestEnv, isolated_serve_env
 
+from tensorrt_llm.inputs.prompt_embeds import PromptEmbeds
+from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
 from tensorrt_llm.serve.prompt_embeds import (
     DISABLED_MESSAGE,
     PROMPT_EMBEDS_MAX_BYTES_ENV,
     ChatPromptEmbedsPart,
     model_hidden_size,
-    splice_chat_prompt_embeds,
 )
 from tensorrt_llm.serve.render.chat import render_chat
+from tensorrt_llm.serve.render.prompt_embeds import splice_chat_prompt_embeds
 from tensorrt_llm.serve.render.prompt_types import UnsupportedRenderError
 from tensorrt_llm.serve.render.resources import RenderResources
 
@@ -85,9 +87,13 @@ def test_completion_single_payload(serve_env: ServeTestEnv, dtype: torch.dtype) 
         response = _completion(client, prompt_embeds=_b64(rows))
     assert response.status_code == 200, response.text
     (call,) = server.generator.generate_calls
-    assert set(call.inputs) == {"prompt_embeds"}
-    assert call.inputs["prompt_embeds"].dtype == dtype
-    assert torch.equal(call.inputs["prompt_embeds"], rows)
+    # The server hands generate_async a validated snapshot it built off the loop.
+    assert call.inputs["prompt_token_ids"] == [0, 0, 0]
+    snapshot = call.inputs["prompt_embeds"]
+    assert isinstance(snapshot, PromptEmbeds)
+    assert snapshot.embeds.dtype == dtype
+    assert torch.equal(snapshot.embeds, rows)
+    assert snapshot.positions.tolist() == [0, 1, 2]
     assert response.json()["usage"]["prompt_tokens"] == 3
 
 
@@ -100,8 +106,8 @@ def test_completion_payloads_then_text_prompts(serve_env: ServeTestEnv) -> None:
     assert response.status_code == 200, response.text
     calls = server.generator.generate_calls
     assert len(calls) == 3
-    assert torch.equal(calls[0].inputs["prompt_embeds"], first)
-    assert torch.equal(calls[1].inputs["prompt_embeds"], second)
+    assert torch.equal(calls[0].inputs["prompt_embeds"].embeds, first)
+    assert torch.equal(calls[1].inputs["prompt_embeds"].embeds, second)
     assert "prompt_embeds" not in calls[2].inputs
     assert [c["index"] for c in response.json()["choices"]] == [0, 1, 2]
 
@@ -196,7 +202,7 @@ def test_chat_part_placement(serve_env: ServeTestEnv) -> None:
     assert response.status_code == 200, response.text
     (call,) = server.generator.generate_calls
     inputs = call.inputs
-    assert set(inputs) == {"prompt_token_ids", "prompt_embeds", "prompt_embeds_mask"}
+    assert set(inputs) == {"prompt_token_ids", "prompt_embeds"}
 
     def enc(text: str) -> List[int]:
         return server.tokenizer.encode(text, add_special_tokens=False)
@@ -209,8 +215,9 @@ def test_chat_part_placement(serve_env: ServeTestEnv) -> None:
     expected_mask += [False] * len(enc("<|user|>hi\n")) + [True] * 3
     expected_mask += [False] * len(enc("\nok<|assistant|>"))
     assert inputs["prompt_token_ids"] == expected_ids
-    assert inputs["prompt_embeds_mask"] == expected_mask
-    assert torch.equal(inputs["prompt_embeds"], torch.cat([first, second]))
+    expected_positions = [i for i, masked in enumerate(expected_mask) if masked]
+    assert inputs["prompt_embeds"].positions.tolist() == expected_positions
+    assert torch.equal(inputs["prompt_embeds"].embeds, torch.cat([first, second]))
     assert server.generator.preprocess_calls == []
 
 
@@ -219,6 +226,7 @@ def test_chat_part_placement(serve_env: ServeTestEnv) -> None:
     [
         ({"prompt_token_ids": [1, 2]}, [], "prompt_token_ids"),
         ({"truncate_prompt_tokens": 4}, [], "truncate_prompt_tokens"),
+        ({"echo": True}, [], "echo"),
     ],
 )
 def test_chat_unsupported_combinations(
@@ -259,9 +267,52 @@ def test_render_chat_refuses_parts(serve_env: ServeTestEnv) -> None:
             render_chat(request, RenderResources.from_server(server))
 
 
+def test_parts_need_opt_in() -> None:
+    """Parsers other than the chat route's (Responses, governor) refuse the part."""
+    messages = [{"role": "user", "content": [_part(torch.zeros(2, HIDDEN))]}]
+    with pytest.raises(ValueError, match="only accepted"):
+        parse_chat_messages_coroutines(messages, None, model_type_override="llama")
+
+
+def test_harmony_refuses_parts(serve_env: ServeTestEnv) -> None:
+    """Harmony models render messages themselves, so the chat route and renderer refuse parts."""
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+
+    server = serve_env.build_openai_server(
+        AggConfig(model_type="gpt_oss", enable_prompt_embeds=True)
+    )
+    messages = [{"role": "user", "content": [_part(torch.zeros(2, 4))]}]
+    with serve_env.client(server.app) as client:
+        response = _chat(client, messages)
+        assert response.status_code == 400
+        assert "harmony" in response.json()["message"]
+        with pytest.raises(UnsupportedRenderError, match="prompt_embeds"):
+            render_chat(
+                ChatCompletionRequest(model="fake-model", messages=messages),
+                RenderResources.from_server(server),
+            )
+    assert server.generator.generate_calls == []
+
+
 def _identity_tokenize(text: str, add_special_tokens: bool) -> List[int]:
     """One id per character; 99 stands for a BOS token."""
     return ([99] if add_special_tokens else []) + [ord(c) for c in text]
+
+
+def _bos_eos_tokenize(text: str, add_special_tokens: bool) -> List[int]:
+    """One id per character; 99 and 98 stand for BOS and EOS."""
+    ids = [ord(c) for c in text]
+    return [99] + ids + [98] if add_special_tokens else ids
+
+
+def test_splice_wraps_whole_prompt_in_special_tokens() -> None:
+    """EOS goes after the last segment, not after the first."""
+    part = ChatPromptEmbedsPart(marker="<M>", data="")
+    out = splice_chat_prompt_embeds(
+        "a<M>b", [part], [torch.zeros(1, 4)], _bos_eos_tokenize, add_special_tokens=True
+    )
+    assert out["prompt_token_ids"] == [99, ord("a"), 0, ord("b"), 98]
+    assert out["prompt_embeds_mask"] == [False, False, True, False, False]
 
 
 def test_splice_special_tokens_only_on_first_segment() -> None:

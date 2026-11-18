@@ -55,6 +55,7 @@ from tensorrt_llm.inputs.media_io import (BaseMediaIO,
                                           log_allowed_local_media_path)
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.prefix_token_cache import tokenization_routing_key
+from tensorrt_llm.inputs.prompt_embeds import build_prompt_embeds
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.inputs.utils import ConversationMessage
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
@@ -138,15 +139,16 @@ from tensorrt_llm.serve.postprocess_handlers import (
     responses_api_streaming_post_processor)
 from tensorrt_llm.serve.prompt_embeds import (DISABLED_MESSAGE,
                                               decode_prompt_embeds,
+                                              has_prompt_embeds_parts,
                                               model_hidden_size, pop_chat_parts,
-                                              prompt_embeds_max_bytes,
-                                              splice_chat_prompt_embeds)
+                                              prompt_embeds_max_bytes)
 from tensorrt_llm.serve.render import (HarmonyConversionError, RenderResources,
                                        UnsupportedRenderError,
                                        mount_render_endpoints,
                                        prepare_chat_request, render_chat,
                                        render_chat_for_length,
-                                       render_conversation, tokenize_rendered)
+                                       render_conversation, resource_tokenizer,
+                                       splice_chat_prompt_embeds)
 from tensorrt_llm.serve.reranker import (Qwen3RerankInputBuilder,
                                          rerank_probability)
 from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
@@ -323,10 +325,35 @@ def _configure_parser_special_token_decoding(
         sampling_params.spaces_between_special_tokens = False
 
 
-def _tokenize_segment(res: RenderResources, text: str,
-                      add_special_tokens: bool) -> List[int]:
-    """Tokenize one text segment of a rendered chat prompt."""
-    return tokenize_rendered(res, text, add_special_tokens=add_special_tokens)
+def _snapshot_embeds_prompt(prompt: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate a prompt_embeds prompt and take the engine's owned snapshot.
+
+    Blocking (copy, finiteness check, hash); run it off the event loop.
+    ``generate_async`` takes the snapshot as is.
+    """
+    token_ids, snapshot = build_prompt_embeds(prompt.get("prompt_token_ids"),
+                                              prompt["prompt_embeds"],
+                                              prompt.get("prompt_embeds_mask"))
+    return {"prompt_token_ids": token_ids, "prompt_embeds": snapshot}
+
+
+def _prepare_completion_embeds(
+        payloads: List[str],
+        hidden_size: Optional[int]) -> List[Dict[str, Any]]:
+    """Decode completion prompt_embeds payloads into engine prompts; blocking."""
+    tensors = decode_prompt_embeds(payloads,
+                                   max_bytes=prompt_embeds_max_bytes(),
+                                   hidden_size=hidden_size)
+    return [_snapshot_embeds_prompt({"prompt_embeds": t}) for t in tensors]
+
+
+def _prepare_chat_embeds(text: str, parts: List[Any],
+                         payload_rows: List[torch.Tensor], res: RenderResources,
+                         add_special_tokens: bool) -> Dict[str, Any]:
+    """Place chat prompt_embeds parts and snapshot the prompt; blocking."""
+    return _snapshot_embeds_prompt(
+        splice_chat_prompt_embeds(text, parts, payload_rows,
+                                  resource_tokenizer(res), add_special_tokens))
 
 
 def _record_generator_termination(generator) -> None:
@@ -2576,6 +2603,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     self.multimodal_server_config,
                     request_media_io_kwargs=request.media_io_kwargs,
                     resolve_media=resolve_media,
+                    accept_prompt_embeds=True,
                 )
             except ValidationError:
                 # ValidatorIterator rejects extra fields; fall back to raw JSON.
@@ -2587,6 +2615,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     self.multimodal_server_config,
                     request_media_io_kwargs=request.media_io_kwargs,
                     resolve_media=resolve_media,
+                    accept_prompt_embeds=True,
                 )
 
             prompt_embeds_parts = pop_chat_parts(conversation)
@@ -2601,6 +2630,9 @@ class OpenAIServer(_VideoRoutesMixin):
                     if request.truncate_prompt_tokens is not None:
                         raise ValueError("truncate_prompt_tokens is not "
                                          "supported with prompt_embeds parts.")
+                    if request.echo:
+                        raise ValueError(
+                            "echo is not supported with prompt_embeds parts.")
                     if any(message.get("media") for message in conversation):
                         raise ValueError("prompt_embeds parts cannot be "
                                          "combined with multimodal content.")
@@ -2656,12 +2688,11 @@ class OpenAIServer(_VideoRoutesMixin):
                             "whose chat renderer returns token ids.")
                     prompt = await self._run_input_processor(
                         functools.partial(
-                            splice_chat_prompt_embeds,
+                            _prepare_chat_embeds,
                             rendered.text,
                             prompt_embeds_parts,
                             prompt_embeds_rows,
-                            functools.partial(_tokenize_segment,
-                                              render_resources),
+                            render_resources,
                             request.add_special_tokens,
                         ))
             prompt = prompt_inputs(prompt)
@@ -3389,9 +3420,9 @@ class OpenAIServer(_VideoRoutesMixin):
                     to_llm_disaggregated_params(request.disaggregated_params))
                 payloads = (request.prompt_embeds if isinstance(
                     request.prompt_embeds, list) else [request.prompt_embeds])
-                embeds_prompts = [{
-                    "prompt_embeds": rows
-                } for rows in await self._decode_prompt_embeds(payloads)]
+                embeds_prompts = await self._run_input_processor(
+                    functools.partial(_prepare_completion_embeds, payloads,
+                                      model_hidden_size(self.model_config)))
                 prompts = embeds_prompts + list(prompts)
 
             stream_response_id = None
@@ -3545,6 +3576,10 @@ class OpenAIServer(_VideoRoutesMixin):
 
         input_started = _start_input_processing()
         try:
+            if has_prompt_embeds_parts(request.messages):
+                # Harmony renders messages itself and would drop the part.
+                return self.create_error_response(
+                    "prompt_embeds parts are not supported for harmony models.")
             ensure_request_chat_template_allowed(
                 request, self.allow_request_chat_template)
             # Named tool_choice (forced function call) is not yet supported on

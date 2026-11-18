@@ -91,10 +91,10 @@ def test_completion_batch_and_stream(
     """Several payloads in one request, streamed, each reproduce their token prompt."""
     texts = ["Water boils at a temperature of", "The largest planet in the solar system is"]
     id_lists = [tokenizer.encode(t, add_special_tokens=False) for t in texts]
-    expected = [
-        client.completions.create(model=model_path, prompt=ids, **_greedy()).choices[0].text
-        for ids in id_lists
-    ]
+    # Batched the same way as the embeddings request: batch composition can
+    # change greedy tokens through kernel numerics.
+    by_ids = client.completions.create(model=model_path, prompt=id_lists, **_greedy())
+    expected = [c.text for c in sorted(by_ids.choices, key=lambda c: c.index)]
     stream = client.completions.create(
         model=model_path,
         prompt=None,

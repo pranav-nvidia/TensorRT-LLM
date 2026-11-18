@@ -228,6 +228,7 @@ def parse_chat_message_content_parts(
     role: str,
     parts: Iterable[ChatCompletionContentPartParam],
     mm_data_tracker: MultimodalDataTracker,
+    accept_prompt_embeds: bool = False,
 ) -> ConversationMessage:
     """Parse multiple parts of a chat message.
 
@@ -243,6 +244,10 @@ def parse_chat_message_content_parts(
     for part in parts:
         if isinstance(part,
                       dict) and part.get("type") == PROMPT_EMBEDS_PART_TYPE:
+            if not accept_prompt_embeds:
+                raise ValueError(
+                    "prompt_embeds content parts are only accepted "
+                    "by /v1/chat/completions.")
             # Rendered as a marker; the chat route replaces it with the rows.
             embeds_part = new_chat_part(part)
             prompt_embeds_parts.append(embeds_part)
@@ -280,7 +285,8 @@ def parse_chat_message_content(
         message: ChatCompletionMessageParam,
         mm_data_tracker: MultimodalDataTracker,
         lenient_tool_call_arguments: bool = False,
-        keep_message_tools: bool = False) -> ConversationMessage:
+        keep_message_tools: bool = False,
+        accept_prompt_embeds: bool = False) -> ConversationMessage:
     """Parse the content of a chat message."""
     role = message["role"]
     content = message.get("content")
@@ -296,6 +302,7 @@ def parse_chat_message_content(
         role,
         content,
         mm_data_tracker,
+        accept_prompt_embeds=accept_prompt_embeds,
     )
     if role == "assistant":
         result.update(
@@ -472,6 +479,7 @@ def parse_chat_messages_coroutines(
     request_media_io_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
     model_type_override: Optional[str] = None,
     resolve_media: bool = True,
+    accept_prompt_embeds: bool = False,
 ) -> Tuple[List[ConversationMessage], Coroutine[Any, Any, tuple[Optional[Dict[
         str, List[Any]]], Optional[Dict[str, List[Any]]]]], list[dict[str,
                                                                       int]]]:
@@ -494,6 +502,9 @@ def parse_chat_messages_coroutines(
         resolve_media: When False the returned coroutine closes the
             pending loads instead of running them and yields
             `(None, None)`.
+        accept_prompt_embeds: Parse `prompt_embeds` parts into markers and
+            per-message `PROMPT_EMBEDS_MESSAGE_KEY` entries for the caller
+            to consume; otherwise such parts are rejected.
 
     Returns:
         `(conversation, mm_coroutine, mm_placeholder_counts)` where
@@ -537,7 +548,8 @@ def parse_chat_messages_coroutines(
             msg,
             mm_data_tracker,
             lenient_tool_call_arguments=(model_type == "kimi_k3"),
-            keep_message_tools=(model_type == "kimi_k3"))
+            keep_message_tools=(model_type == "kimi_k3"),
+            accept_prompt_embeds=accept_prompt_embeds)
         conversation.append(parsed_msg)
 
         # Track placeholders added for this message only.

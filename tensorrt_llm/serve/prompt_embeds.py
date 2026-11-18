@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""``prompt_embeds`` on the OpenAI routes: payload decoding and chat placement.
+"""``prompt_embeds`` on the OpenAI routes: request parts and payload decoding.
 
 Completions take ``prompt_embeds`` as one or more base64 ``torch.save`` payloads,
 each a whole prompt of ``[L, hidden_size]`` rows. Chat takes a content part
 ``{"type": "prompt_embeds", "prompt_embeds": {"data": <base64>}}``: the part
-renders as a unique marker, and after the chat template runs, each marker becomes
-a run of placeholder ids whose positions take the part's rows.
+renders as a unique marker, and ``serve.render.prompt_embeds`` turns each marker
+into a run of placeholder ids whose positions take the part's rows.
 
 Tensor payloads from clients are untrusted, so the server accepts them only when
 started with ``--enable_prompt_embeds``. Decoding is bounded by
@@ -16,7 +16,7 @@ started with ``--enable_prompt_embeds``. Decoding is bounded by
 import os
 import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 
@@ -103,7 +103,8 @@ def decode_prompt_embeds(
     remaining = max_bytes
     for index, payload in enumerate(payloads):
         tensor = load_base64_tensor(payload, max_bytes=remaining)
-        remaining -= tensor.untyped_storage().nbytes()
+        # Logical size: an expanded view stores little but materializes all.
+        remaining -= tensor.numel() * tensor.element_size()
         if tensor.dim() != 2:
             raise ValueError(
                 f"prompt_embeds[{index}] must have shape [num_tokens, hidden_size], "
@@ -135,76 +136,21 @@ def model_hidden_size(model_config: Any) -> Optional[int]:
     return hidden_size if isinstance(hidden_size, int) else None
 
 
+def has_prompt_embeds_parts(messages: Any) -> bool:
+    """Whether any raw chat message carries a ``prompt_embeds`` content part."""
+    for message in messages or []:
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list) and any(
+            isinstance(part, dict) and part.get("type") == PROMPT_EMBEDS_PART_TYPE
+            for part in content
+        ):
+            return True
+    return False
+
+
 def pop_chat_parts(conversation: List[Dict[str, Any]]) -> List[ChatPromptEmbedsPart]:
     """Remove and return the ``prompt_embeds`` parts of parsed chat messages."""
     parts: List[ChatPromptEmbedsPart] = []
     for message in conversation:
         parts.extend(message.pop(PROMPT_EMBEDS_MESSAGE_KEY, None) or ())
     return parts
-
-
-def splice_chat_prompt_embeds(
-    text: str,
-    parts: Sequence[ChatPromptEmbedsPart],
-    rows: Sequence[torch.Tensor],
-    tokenize: Callable[[str, bool], List[int]],
-    add_special_tokens: bool,
-) -> Dict[str, Any]:
-    """Turn a rendered chat prompt with part markers into an embeddings prompt.
-
-    The text between markers is tokenized segment by segment (special tokens
-    only for the first segment, when requested); each marker becomes one
-    placeholder id per row of its part.
-
-    Args:
-        text: The rendered chat prompt.
-        parts: The request's parts; each marker must occur exactly once.
-        rows: Decoded rows of each part, in ``parts`` order.
-        tokenize: ``tokenize(segment, add_special_tokens)`` with the engine's
-            tokenizer.
-        add_special_tokens: Whether the prompt gets the tokenizer's special
-            tokens (e.g. BOS).
-
-    Returns:
-        A ``TokensPrompt`` dict with ``prompt_embeds`` and ``prompt_embeds_mask``.
-    """
-    dtypes = {r.dtype for r in rows}
-    if len(dtypes) > 1:
-        raise ValueError(
-            f"All prompt_embeds parts of a request must share one dtype, got "
-            f"{sorted(str(d) for d in dtypes)}."
-        )
-    placed = []
-    for part, part_rows in zip(parts, rows):
-        offset = text.find(part.marker)
-        if offset < 0:
-            raise ValueError("The chat template dropped a message holding a prompt_embeds part.")
-        if text.find(part.marker, offset + 1) >= 0:
-            raise ValueError("The chat template repeated a message holding a prompt_embeds part.")
-        placed.append((offset, part.marker, part_rows))
-    placed.sort(key=lambda item: item[0])
-
-    token_ids: List[int] = []
-    mask: List[bool] = []
-
-    def add_text(segment: str) -> None:
-        """Append the ids of one text segment."""
-        first = not token_ids
-        if not segment and not (first and add_special_tokens):
-            return
-        ids = tokenize(segment, add_special_tokens and first)
-        token_ids.extend(ids)
-        mask.extend([False] * len(ids))
-
-    cursor = 0
-    for offset, marker, part_rows in placed:
-        add_text(text[cursor:offset])
-        token_ids.extend([PLACEHOLDER_TOKEN_ID] * part_rows.shape[0])
-        mask.extend([True] * part_rows.shape[0])
-        cursor = offset + len(marker)
-    add_text(text[cursor:])
-    return {
-        "prompt_token_ids": token_ids,
-        "prompt_embeds": torch.cat([r for _, _, r in placed], dim=0),
-        "prompt_embeds_mask": mask,
-    }

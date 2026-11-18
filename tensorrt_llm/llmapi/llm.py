@@ -1003,6 +1003,17 @@ class BaseLLM:
         if prompt_token_ids is not None:
             prompt_token_ids = self._normalize_token_ids(
                 prompt_token_ids, "prompt_token_ids")
+        if isinstance(inputs["prompt_embeds"], PromptEmbeds):
+            # A snapshot build_prompt_embeds already validated, e.g. off
+            # trtllm-serve's event loop; hashing it again would block there.
+            snapshot = inputs["prompt_embeds"]
+            if (prompt_token_ids is None or snapshot.embeds is None
+                    or inputs.get("prompt_embeds_mask") is not None
+                    or int(snapshot.positions[-1]) >= len(prompt_token_ids)):
+                raise ValueError(
+                    "A PromptEmbeds snapshot needs the prompt_token_ids it "
+                    "was built for and no prompt_embeds_mask.")
+            return TokensPrompt(prompt_token_ids=prompt_token_ids), snapshot
         prompt_token_ids, prompt_embeds = build_prompt_embeds(
             prompt_token_ids, inputs["prompt_embeds"],
             inputs.get("prompt_embeds_mask"))
