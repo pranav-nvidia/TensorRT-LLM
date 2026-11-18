@@ -4,6 +4,8 @@
 import asyncio
 import base64
 import binascii
+import pickle
+import pickletools
 import zipfile
 from collections import defaultdict
 from io import BytesIO
@@ -70,36 +72,83 @@ def load_base64_image_embeds(str_content: str) -> torch.Tensor:
     return image_data
 
 
+# The only pickle globals ``torch.save`` writes for one float16, bfloat16 or
+# float32 tensor. Anything else could allocate or run code while unpickling,
+# even under ``weights_only=True`` (which allows e.g. ``bytearray``).
+_TENSOR_PICKLE_GLOBALS = frozenset({
+    "collections OrderedDict",
+    "torch._utils _rebuild_tensor_v2",
+    "torch FloatStorage",
+    "torch BFloat16Storage",
+    "torch HalfStorage",
+})
+_TENSOR_PICKLE_FORBIDDEN_OPS = frozenset({
+    "STACK_GLOBAL", "INST", "OBJ", "NEWOBJ", "NEWOBJ_EX", "EXT1", "EXT2",
+    "EXT4", "PERSID"
+})
+# A single tensor's pickle is a few hundred bytes.
+_TENSOR_PICKLE_MAX_BYTES = 64 * 1024
+
+
+def _check_tensor_pickle(pickled: bytes) -> None:
+    """Reject a tensor pickle that names anything beyond one tensor's rebuild."""
+    if len(pickled) > _TENSOR_PICKLE_MAX_BYTES:
+        raise ValueError(
+            f"Tensor payload pickle is {len(pickled)} bytes; one tensor needs "
+            f"far less than {_TENSOR_PICKLE_MAX_BYTES}.")
+    try:
+        ops = list(pickletools.genops(pickled))
+    except ValueError as e:
+        raise ValueError(f"Tensor payload pickle is malformed: {e}") from e
+    for opcode, arg, _ in ops:
+        if opcode.name in _TENSOR_PICKLE_FORBIDDEN_OPS:
+            raise ValueError(
+                f"Tensor payload uses unsupported pickle opcode {opcode.name}.")
+        if opcode.name == "GLOBAL" and arg not in _TENSOR_PICKLE_GLOBALS:
+            raise ValueError(
+                f"Tensor payload references {arg!r}; only float16, bfloat16 "
+                "and float32 tensors are accepted (unsupported dtype or type).")
+
+
 def _check_tensor_archive(content: bytes, max_bytes: int) -> None:
     """Reject a ``torch.save`` payload that could allocate more than it carries.
 
-    Only the zip format is accepted and every member must be stored
-    uncompressed, so what ``torch.load`` allocates is bounded by the payload
-    size rather than by sizes the payload declares.
+    Only the zip format with uncompressed members is accepted, so storage bytes
+    are bounded by the payload size, and the pickle may only rebuild one
+    float16, bfloat16 or float32 tensor.
     """
     try:
         with zipfile.ZipFile(BytesIO(content)) as archive:
             members = archive.infolist()
+            pickles = [m for m in members if m.filename.endswith("/data.pkl")]
+            total = 0
+            for member in members:
+                if member.compress_type != zipfile.ZIP_STORED:
+                    raise ValueError(
+                        "Tensor payload members must be uncompressed.")
+                total += member.file_size
+            if total > max_bytes:
+                raise ValueError(
+                    f"Tensor payload expands to {total} bytes, over the "
+                    f"{max_bytes}-byte limit.")
+            if len(pickles) != 1:
+                raise ValueError(
+                    "Tensor payload must hold exactly one data.pkl record.")
+            pickled = archive.read(pickles[0])
     except zipfile.BadZipFile as e:
         raise ValueError(
             "Tensor payload must be a torch.save zip archive.") from e
-    total = 0
-    for member in members:
-        if member.compress_type != zipfile.ZIP_STORED:
-            raise ValueError("Tensor payload members must be uncompressed.")
-        total += member.file_size
-    if total > max_bytes:
-        raise ValueError(f"Tensor payload expands to {total} bytes, over the "
-                         f"{max_bytes}-byte limit.")
+    _check_tensor_pickle(pickled)
 
 
 def load_base64_tensor(data: str, *, max_bytes: int) -> torch.Tensor:
     """Decode one dense tensor from base64-encoded ``torch.save`` bytes.
 
-    The encoded length is checked before decoding and the archive before
-    loading, so nothing allocated here exceeds ``max_bytes``. Loading uses
-    ``weights_only=True`` and maps storages to CPU. Callers check dtype and
-    shape.
+    The encoded length is checked before decoding and the archive and its
+    pickle before loading, so nothing allocated here exceeds ``max_bytes``;
+    the tensor's logical size (``numel * element_size``) is bounded too.
+    Loading uses ``weights_only=True`` and maps storages to CPU. Only float16,
+    bfloat16 and float32 tensors load. Callers check shape.
 
     Args:
         data: Standard base64 text (no line breaks) of a ``torch.save`` file.
@@ -126,13 +175,20 @@ def load_base64_tensor(data: str, *, max_bytes: int) -> torch.Tensor:
     try:
         with BytesIO(content) as buf:
             value = torch.load(buf, weights_only=True, map_location="cpu")
-    except Exception as e:
+    except (pickle.UnpicklingError, RuntimeError, EOFError, KeyError,
+            TypeError) as e:
         raise ValueError(f"Tensor payload could not be loaded: {e}") from e
     if not isinstance(value, torch.Tensor):
         raise TypeError(f"Tensor payload must hold a single tensor, got "
                         f"{type(value).__name__}.")
     if value.layout != torch.strided or value.is_quantized or value.is_nested:
         raise TypeError("Tensor payload must be a dense strided tensor.")
+    logical_bytes = value.numel() * value.element_size()
+    if logical_bytes > max_bytes:
+        # A view (e.g. expand) can describe far more elements than it stores.
+        raise ValueError(
+            f"Tensor payload describes {logical_bytes} bytes, over the "
+            f"{max_bytes}-byte limit.")
     return value
 
 

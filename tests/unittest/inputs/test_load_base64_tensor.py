@@ -93,10 +93,48 @@ def test_compressed_members_rejected() -> None:
 
 
 def test_arbitrary_pickle_rejected() -> None:
-    """weights_only loading refuses objects outside the tensor allowlist."""
+    """Globals outside one tensor's rebuild are refused before loading."""
     payload = _encode({"cls": pickle.Pickler})
-    with pytest.raises(ValueError, match="could not be loaded"):
+    with pytest.raises(ValueError, match="references"):
         load_base64_tensor(payload, max_bytes=_LIMIT)
+
+
+class _BigBytearray:
+    """Pickles as ``bytearray(n)``: allowed by weights_only, allocates on load."""
+
+    def __reduce__(self) -> tuple:
+        return (bytearray, (1 << 30,))
+
+
+def _replace_pickle(payload: str, pickled: bytes) -> str:
+    """Swap the data.pkl record of a torch.save archive."""
+    src = zipfile.ZipFile(io.BytesIO(base64.b64decode(payload)))
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_STORED) as dst:
+        for info in src.infolist():
+            data = pickled if info.filename.endswith("/data.pkl") else src.read(info)
+            dst.writestr(info.filename, data)
+    return base64.b64encode(out.getvalue()).decode("ascii")
+
+
+def test_allocating_reducer_rejected() -> None:
+    """A tiny pickle that would allocate 1 GiB while unpickling is refused unread."""
+    payload = _replace_pickle(_encode(torch.zeros(2)), pickle.dumps(_BigBytearray(), protocol=2))
+    with pytest.raises(ValueError, match="bytearray"):
+        load_base64_tensor(payload, max_bytes=_LIMIT)
+
+
+def test_expanded_view_over_logical_limit() -> None:
+    """A view describing more elements than it stores is bounded by its logical size."""
+    view = torch.zeros(1, 1024).expand(4096, 1024)
+    with pytest.raises(ValueError, match="describes"):
+        load_base64_tensor(_encode(view), max_bytes=_LIMIT)
+
+
+def test_integer_tensor_rejected() -> None:
+    """Only float16, bfloat16 and float32 storages are accepted."""
+    with pytest.raises(ValueError, match="unsupported dtype"):
+        load_base64_tensor(_encode(torch.zeros(2, 2, dtype=torch.int32)), max_bytes=_LIMIT)
 
 
 def test_non_tensor_rejected() -> None:
