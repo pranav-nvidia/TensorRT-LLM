@@ -72,26 +72,30 @@ def load_base64_image_embeds(str_content: str) -> torch.Tensor:
     return image_data
 
 
-# The only pickle globals ``torch.save`` writes for one float16, bfloat16 or
-# float32 tensor. Anything else could allocate or run code while unpickling,
-# even under ``weights_only=True`` (which allows e.g. ``bytearray``).
-_TENSOR_PICKLE_GLOBALS = frozenset({
-    "collections OrderedDict",
-    "torch._utils _rebuild_tensor_v2",
+# A ``torch.save`` pickle of one tensor: three globals (the rebuild function,
+# one storage class, ``OrderedDict`` for the empty hooks), two calls, one
+# storage reference, and only scalars and tuples otherwise. Anything more, even
+# allowed reducers called again or memoized objects reused, can allocate far
+# beyond the payload size while unpickling, despite ``weights_only=True``.
+_TENSOR_REBUILD = "torch._utils _rebuild_tensor_v2"
+_TENSOR_HOOKS = "collections OrderedDict"
+_TENSOR_STORAGES = frozenset({
     "torch FloatStorage",
     "torch BFloat16Storage",
     "torch HalfStorage",
 })
-_TENSOR_PICKLE_FORBIDDEN_OPS = frozenset({
-    "STACK_GLOBAL", "INST", "OBJ", "NEWOBJ", "NEWOBJ_EX", "EXT1", "EXT2",
-    "EXT4", "PERSID"
+_TENSOR_PICKLE_OPS = frozenset({
+    "PROTO", "FRAME", "GLOBAL", "BINPUT", "LONG_BINPUT", "MEMOIZE", "MARK",
+    "BINUNICODE", "SHORT_BINUNICODE", "BININT", "BININT1", "BININT2", "LONG1",
+    "TUPLE", "TUPLE1", "TUPLE2", "TUPLE3", "EMPTY_TUPLE", "NEWFALSE", "NEWTRUE",
+    "BINPERSID", "REDUCE", "STOP"
 })
-# A single tensor's pickle is a few hundred bytes.
-_TENSOR_PICKLE_MAX_BYTES = 64 * 1024
+# A single tensor's pickle is about 160 bytes.
+_TENSOR_PICKLE_MAX_BYTES = 4096
 
 
 def _check_tensor_pickle(pickled: bytes) -> None:
-    """Reject a tensor pickle that names anything beyond one tensor's rebuild."""
+    """Reject a pickle that is not exactly one tensor's rebuild."""
     if len(pickled) > _TENSOR_PICKLE_MAX_BYTES:
         raise ValueError(
             f"Tensor payload pickle is {len(pickled)} bytes; one tensor needs "
@@ -100,14 +104,33 @@ def _check_tensor_pickle(pickled: bytes) -> None:
         ops = list(pickletools.genops(pickled))
     except ValueError as e:
         raise ValueError(f"Tensor payload pickle is malformed: {e}") from e
+    globals_seen = []
+    reduces = persids = 0
     for opcode, arg, _ in ops:
-        if opcode.name in _TENSOR_PICKLE_FORBIDDEN_OPS:
+        if opcode.name not in _TENSOR_PICKLE_OPS:
             raise ValueError(
                 f"Tensor payload uses unsupported pickle opcode {opcode.name}.")
-        if opcode.name == "GLOBAL" and arg not in _TENSOR_PICKLE_GLOBALS:
-            raise ValueError(
-                f"Tensor payload references {arg!r}; only float16, bfloat16 "
-                "and float32 tensors are accepted (unsupported dtype or type).")
+        if opcode.name == "GLOBAL":
+            globals_seen.append(arg)
+        reduces += opcode.name == "REDUCE"
+        persids += opcode.name == "BINPERSID"
+    storages = [g for g in globals_seen if g in _TENSOR_STORAGES]
+    others = [
+        g for g in globals_seen
+        if g not in _TENSOR_STORAGES and g not in (_TENSOR_REBUILD,
+                                                   _TENSOR_HOOKS)
+    ]
+    if others or len(storages) != 1:
+        unexpected = others or storages or ["no storage"]
+        raise ValueError(
+            f"Tensor payload references {unexpected[0]!r}; only one float16, "
+            "bfloat16 or float32 tensor is accepted (unsupported dtype or type)."
+        )
+    if (globals_seen.count(_TENSOR_REBUILD) != 1
+            or globals_seen.count(_TENSOR_HOOKS) > 1 or reduces != 2
+            or persids != 1):
+        raise ValueError(
+            "Tensor payload pickle must rebuild exactly one tensor.")
 
 
 def _check_tensor_archive(content: bytes, max_bytes: int) -> None:

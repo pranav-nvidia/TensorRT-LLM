@@ -4,6 +4,7 @@
 
 import asyncio
 import base64
+import collections
 import io
 import pickle
 import zipfile
@@ -95,7 +96,7 @@ def test_compressed_members_rejected() -> None:
 def test_arbitrary_pickle_rejected() -> None:
     """Globals outside one tensor's rebuild are refused before loading."""
     payload = _encode({"cls": pickle.Pickler})
-    with pytest.raises(ValueError, match="references"):
+    with pytest.raises(ValueError, match="unsupported pickle opcode|references"):
         load_base64_tensor(payload, max_bytes=_LIMIT)
 
 
@@ -138,8 +139,8 @@ def test_integer_tensor_rejected() -> None:
 
 
 def test_non_tensor_rejected() -> None:
-    """A container of tensors is not a single tensor."""
-    with pytest.raises(TypeError, match="single tensor"):
+    """A container of tensors is not a single tensor's pickle."""
+    with pytest.raises(ValueError, match="unsupported pickle opcode"):
         load_base64_tensor(_encode([torch.zeros(2)]), max_bytes=_LIMIT)
 
 
@@ -148,3 +149,32 @@ def test_sparse_rejected() -> None:
     sparse = torch.zeros(4, 4).to_sparse()
     with pytest.raises((TypeError, ValueError)):
         load_base64_tensor(_encode(sparse), max_bytes=_LIMIT)
+
+
+def test_repeated_allowed_reducer_rejected_before_load(monkeypatch) -> None:
+    """Copies of one memoized dict through OrderedDict amplify memory; refuse unread."""
+    shared = {i: i for i in range(16)}
+    copies = [collections.OrderedDict(shared) for _ in range(8)]
+    payload = _replace_pickle(_encode(torch.zeros(2)), pickle.dumps(copies, protocol=2))
+
+    def no_load(*args: object, **kwargs: object) -> None:
+        raise AssertionError("torch.load must not run on a rejected payload")
+
+    monkeypatch.setattr(torch, "load", no_load)
+    with pytest.raises(ValueError, match="unsupported pickle opcode"):
+        load_base64_tensor(payload, max_bytes=_LIMIT)
+
+
+@pytest.mark.parametrize(
+    "tensor",
+    [
+        torch.zeros(4, 3)[::2],
+        torch.zeros(3, 2).t(),
+        torch.zeros(2, requires_grad=True),
+        torch.zeros(1000, 64, dtype=torch.bfloat16),
+    ],
+)
+def test_ordinary_saved_tensors_accepted(tensor: torch.Tensor) -> None:
+    """Views, transposes, grad flags and large shapes still pass the pickle check."""
+    decoded = load_base64_tensor(_encode(tensor), max_bytes=_LIMIT)
+    assert torch.equal(decoded, tensor.detach())
