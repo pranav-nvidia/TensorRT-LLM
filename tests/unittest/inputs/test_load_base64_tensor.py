@@ -256,6 +256,14 @@ def test_extra_archive_records_rejected(monkeypatch, names: list, match: str) ->
         load_base64_tensor(payload, max_bytes=8 << 20)
 
 
+def test_prefixed_archive_rejected(monkeypatch) -> None:
+    """Bytes before the first record make zipfile and torch.load read different records."""
+    payload = base64.b64encode(b"\0" * 64 + base64.b64decode(_encode(torch.zeros(2)))).decode()
+    _no_load(monkeypatch)
+    with pytest.raises(ValueError, match="start with its first record"):
+        load_base64_tensor(payload, max_bytes=_LIMIT)
+
+
 @pytest.mark.parametrize(
     "tensor",
     [
