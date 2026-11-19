@@ -72,18 +72,19 @@ def load_base64_image_embeds(str_content: str) -> torch.Tensor:
     return image_data
 
 
-# A ``torch.save`` pickle of one tensor: three globals (the rebuild function,
-# one storage class, ``OrderedDict`` for the empty hooks), two calls, one
-# storage reference, and only scalars and tuples otherwise. Anything more, even
-# allowed reducers called again or memoized objects reused, can allocate far
-# beyond the payload size while unpickling, despite ``weights_only=True``.
+# A ``torch.save`` pickle of one tensor is a single call
+# ``_rebuild_tensor_v2(storage, offset, size, stride, requires_grad,
+# OrderedDict())`` whose storage is a persistent id. The checker below replays
+# the pickle's stack symbolically and accepts only that shape, so nothing
+# ``weights_only=True`` would still execute (a reducer wrapping the tensor, a
+# reducer called again on memoized objects) can allocate before the size checks.
 _TENSOR_REBUILD = "torch._utils _rebuild_tensor_v2"
 _TENSOR_HOOKS = "collections OrderedDict"
-_TENSOR_STORAGES = frozenset({
-    "torch FloatStorage",
-    "torch BFloat16Storage",
-    "torch HalfStorage",
-})
+_TENSOR_STORAGE_ELEMENT_SIZES = {
+    "torch FloatStorage": 4,
+    "torch BFloat16Storage": 2,
+    "torch HalfStorage": 2,
+}
 _TENSOR_PICKLE_OPS = frozenset({
     "PROTO", "FRAME", "GLOBAL", "BINPUT", "LONG_BINPUT", "MEMOIZE", "MARK",
     "BINUNICODE", "SHORT_BINUNICODE", "BININT", "BININT1", "BININT2", "LONG1",
@@ -92,58 +93,166 @@ _TENSOR_PICKLE_OPS = frozenset({
 })
 # A single tensor's pickle is about 160 bytes.
 _TENSOR_PICKLE_MAX_BYTES = 4096
+# torch.save writes seven records for one tensor.
+_TENSOR_ARCHIVE_MAX_RECORDS = 16
+_TENSOR_ARCHIVE_RECORDS = frozenset({
+    "data.pkl", "byteorder", "version", ".format_version", ".storage_alignment",
+    ".data/version", ".data/serialization_id"
+})
 
 
-def _check_tensor_pickle(pickled: bytes) -> None:
-    """Reject a pickle that is not exactly one tensor's rebuild."""
-    if len(pickled) > _TENSOR_PICKLE_MAX_BYTES:
-        raise ValueError(
-            f"Tensor payload pickle is {len(pickled)} bytes; one tensor needs "
-            f"far less than {_TENSOR_PICKLE_MAX_BYTES}.")
+class _PickleGlobal(NamedTuple):
+    name: str
+
+
+class _PickleCall(NamedTuple):
+    func: object
+    args: tuple
+
+
+class _PicklePersistentId(NamedTuple):
+    pid: object
+
+
+_PICKLE_MARK = object()
+
+
+def _replay_tensor_pickle(pickled: bytes) -> object:
+    """Replay the pickle's stack without calling anything; return its result."""
     try:
         ops = list(pickletools.genops(pickled))
     except ValueError as e:
         raise ValueError(f"Tensor payload pickle is malformed: {e}") from e
-    globals_seen = []
-    reduces = persids = 0
-    for opcode, arg, _ in ops:
-        if opcode.name not in _TENSOR_PICKLE_OPS:
-            raise ValueError(
-                f"Tensor payload uses unsupported pickle opcode {opcode.name}.")
-        if opcode.name == "GLOBAL":
-            globals_seen.append(arg)
-        reduces += opcode.name == "REDUCE"
-        persids += opcode.name == "BINPERSID"
-    storages = [g for g in globals_seen if g in _TENSOR_STORAGES]
-    others = [
-        g for g in globals_seen
-        if g not in _TENSOR_STORAGES and g not in (_TENSOR_REBUILD,
-                                                   _TENSOR_HOOKS)
-    ]
-    if others or len(storages) != 1:
-        unexpected = others or storages or ["no storage"]
-        raise ValueError(
-            f"Tensor payload references {unexpected[0]!r}; only one float16, "
-            "bfloat16 or float32 tensor is accepted (unsupported dtype or type)."
-        )
-    if (globals_seen.count(_TENSOR_REBUILD) != 1
-            or globals_seen.count(_TENSOR_HOOKS) > 1 or reduces != 2
-            or persids != 1):
+    stack: List[object] = []
+    try:
+        for opcode, arg, _ in ops:
+            name = opcode.name
+            if name not in _TENSOR_PICKLE_OPS:
+                raise ValueError(
+                    f"Tensor payload uses unsupported pickle opcode {name}.")
+            if name == "STOP":
+                break
+            if name in ("PROTO", "FRAME", "BINPUT", "LONG_BINPUT", "MEMOIZE"):
+                continue
+            if name == "MARK":
+                stack.append(_PICKLE_MARK)
+            elif name == "GLOBAL":
+                if (arg not in (_TENSOR_REBUILD, _TENSOR_HOOKS)
+                        and arg not in _TENSOR_STORAGE_ELEMENT_SIZES):
+                    raise ValueError(
+                        f"Tensor payload references {arg!r}; only one "
+                        "float16, bfloat16 or float32 tensor is accepted "
+                        "(unsupported dtype or type).")
+                stack.append(_PickleGlobal(arg))
+            elif name == "NEWFALSE" or name == "NEWTRUE":
+                stack.append(name == "NEWTRUE")
+            elif name == "EMPTY_TUPLE":
+                stack.append(())
+            elif name in ("TUPLE1", "TUPLE2", "TUPLE3", "TUPLE"):
+                start = (len(stack) -
+                         int(name[-1]) if name != "TUPLE" else len(stack) -
+                         stack[::-1].index(_PICKLE_MARK))
+                items = tuple(stack[start:])
+                if start < 0 or _PICKLE_MARK in items:
+                    raise ValueError("Tensor payload pickle is malformed.")
+                del stack[start - (name == "TUPLE"):]
+                stack.append(items)
+            elif name == "BINPERSID":
+                stack.append(_PicklePersistentId(stack.pop()))
+            elif name == "REDUCE":
+                args = stack.pop()
+                if not isinstance(args, tuple):
+                    raise ValueError("Tensor payload pickle is malformed.")
+                stack.append(_PickleCall(stack.pop(), args))
+            elif arg is not None:
+                stack.append(arg)
+    except (IndexError, ValueError) as e:
+        if isinstance(e, ValueError) and str(e).startswith("Tensor payload"):
+            raise
+        raise ValueError("Tensor payload pickle is malformed.") from e
+    if len(stack) != 1:
         raise ValueError(
             "Tensor payload pickle must rebuild exactly one tensor.")
+    return stack[0]
+
+
+def _is_int_tuple(value: object) -> bool:
+    return isinstance(value, tuple) and all(
+        type(v) is int and v >= 0 for v in value)
+
+
+def _check_tensor_pickle(pickled: bytes, max_bytes: int) -> Tuple[str, int]:
+    """Check that a pickle rebuilds one bounded tensor.
+
+    Returns:
+        The storage record key and the storage size in bytes.
+    """
+    if len(pickled) > _TENSOR_PICKLE_MAX_BYTES:
+        raise ValueError(
+            f"Tensor payload pickle is {len(pickled)} bytes; one tensor needs "
+            f"far less than {_TENSOR_PICKLE_MAX_BYTES}.")
+    root = _replay_tensor_pickle(pickled)
+    malformed = ValueError(
+        "Tensor payload pickle must rebuild exactly one tensor.")
+    if not (isinstance(root, _PickleCall) and root.func
+            == _PickleGlobal(_TENSOR_REBUILD) and len(root.args) == 6):
+        raise malformed
+    storage, offset, size, stride, requires_grad, hooks = root.args
+    if hooks != _PickleCall(_PickleGlobal(_TENSOR_HOOKS), ()):
+        raise malformed
+    pid = storage.pid if isinstance(storage, _PicklePersistentId) else None
+    if not (isinstance(pid, tuple) and len(pid) == 5 and pid[0] == "storage"
+            and isinstance(pid[1], _PickleGlobal) and isinstance(pid[2], str)
+            and isinstance(pid[3], str) and type(pid[4]) is int):
+        raise malformed
+    element_size = _TENSOR_STORAGE_ELEMENT_SIZES.get(pid[1].name)
+    if element_size is None:
+        raise malformed
+    if not (type(offset) is int and offset >= 0 and _is_int_tuple(size)
+            and _is_int_tuple(stride) and len(size) == len(stride)
+            and isinstance(requires_grad, bool) and pid[4] >= 0):
+        raise malformed
+    storage_bytes = pid[4] * element_size
+    logical_bytes = element_size
+    for dim in size:
+        logical_bytes *= dim
+    if max(logical_bytes, storage_bytes) > max_bytes:
+        # A view (e.g. expand) can describe far more elements than it stores.
+        raise ValueError(
+            f"Tensor payload describes {max(logical_bytes, storage_bytes)} "
+            f"bytes, over the {max_bytes}-byte limit.")
+    if logical_bytes and offset + sum(
+        (d - 1) * s for d, s in zip(size, stride)) >= pid[4]:
+        raise ValueError("Tensor payload view reaches past its storage.")
+    return pid[2], storage_bytes
 
 
 def _check_tensor_archive(content: bytes, max_bytes: int) -> None:
     """Reject a ``torch.save`` payload that could allocate more than it carries.
 
-    Only the zip format with uncompressed members is accepted, so storage bytes
-    are bounded by the payload size, and the pickle may only rebuild one
-    float16, bfloat16 or float32 tensor.
+    Only the zip format with the records ``torch.save`` writes for one tensor,
+    all uncompressed, is accepted, so storage bytes are bounded by the payload
+    size, and the pickle may only rebuild one float16, bfloat16 or float32
+    tensor.
     """
+    # ZipFile parses every central directory record up front, and each starts
+    # with this signature, so its count bounds that work.
+    if content.count(b"PK\x01\x02") > _TENSOR_ARCHIVE_MAX_RECORDS:
+        raise ValueError("Tensor payload archive has too many records.")
     try:
         with zipfile.ZipFile(BytesIO(content)) as archive:
             members = archive.infolist()
-            pickles = [m for m in members if m.filename.endswith("/data.pkl")]
+            names = [m.filename for m in members]
+            prefix = names[0].split("/", 1)[0] + "/" if names else ""
+            records = [n[len(prefix):] for n in names if n.startswith(prefix)]
+            data = [r for r in records if r.startswith("data/")]
+            if (len(records) != len(names) or len(set(names)) != len(names)
+                    or "data.pkl" not in records or len(data) > 1
+                    or any(r not in _TENSOR_ARCHIVE_RECORDS
+                           for r in records if not r.startswith("data/"))):
+                raise ValueError(
+                    "Tensor payload archive must hold only the records "
+                    "torch.save writes for one tensor.")
             total = 0
             for member in members:
                 if member.compress_type != zipfile.ZIP_STORED:
@@ -154,14 +263,16 @@ def _check_tensor_archive(content: bytes, max_bytes: int) -> None:
                 raise ValueError(
                     f"Tensor payload expands to {total} bytes, over the "
                     f"{max_bytes}-byte limit.")
-            if len(pickles) != 1:
+            key, storage_bytes = _check_tensor_pickle(
+                archive.read(prefix + "data.pkl"), max_bytes)
+            if (data != [f"data/{key}"]
+                    or archive.getinfo(prefix + data[0]).file_size
+                    != storage_bytes):
                 raise ValueError(
-                    "Tensor payload must hold exactly one data.pkl record.")
-            pickled = archive.read(pickles[0])
+                    "Tensor payload storage record does not match its tensor.")
     except zipfile.BadZipFile as e:
         raise ValueError(
             "Tensor payload must be a torch.save zip archive.") from e
-    _check_tensor_pickle(pickled)
 
 
 def load_base64_tensor(data: str, *, max_bytes: int) -> torch.Tensor:
