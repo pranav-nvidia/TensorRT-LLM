@@ -234,6 +234,20 @@ def test_qwen2_5_video_scales_time_by_second_per_grid():
 
 
 @pytest.mark.parametrize(
+    "timing, match",
+    [
+        ({}, "exactly one of"),
+        ({"fps": 2.0, "second_per_grid_ts": 1.0}, "exactly one of"),
+        ({"timestamps": [0.0, 1.0]}, "not 'timestamps'"),
+    ],
+)
+def test_qwen2_5_video_requires_one_time_scale(timing, match):
+    processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
+    with pytest.raises(ValueError, match=match):
+        _attach(processor, "<|video_pad|>", {"video": [_video(2, 2, 2, **timing)]})
+
+
+@pytest.mark.parametrize(
     "embeddings, prompt, match",
     [
         ({"video": [_video(2, 4, 2)]}, "<|video_pad|>", "timestamps"),

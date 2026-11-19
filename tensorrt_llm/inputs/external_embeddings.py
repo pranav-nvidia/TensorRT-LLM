@@ -42,7 +42,10 @@ class ExternalEmbeddingItem:
     timestamps: Optional[tuple[float, ...]] = None
     """Seconds per temporal patch, for models that print frame timestamps."""
     fps: Optional[float] = None
+    """Frames per second. Qwen3-VL reads it with ``frames_indices`` as the
+    source video's rate; Qwen2.5-VL reads it alone as the sampled rate."""
     frames_indices: Optional[tuple[int, ...]] = None
+    """Source frame index of each sampled frame (Qwen3-VL)."""
     second_per_grid_ts: Optional[float] = None
     """Seconds covered by one temporal patch, for models that scale MRoPE time."""
 

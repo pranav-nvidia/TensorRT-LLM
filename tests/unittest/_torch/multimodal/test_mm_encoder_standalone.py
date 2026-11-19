@@ -1219,7 +1219,9 @@ def test_external_video_embeddings_without_overlap_scheduler(
     untied = _greedy_tokens_before_first_tie(reference.outputs[0])
     assert len(untied) >= 4
     assert first.outputs[0].token_ids[:len(untied)] == untied
-    assert replay.cached_tokens > 0
+    # The replay reuses KV past the text before the video.
+    assert replay.cached_tokens > reference.prompt_token_ids.index(
+        no_overlap_llm.input_processor.config.video_token_id)
     assert replay.outputs[0].token_ids[:len(untied)] == untied
 
 

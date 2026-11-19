@@ -1318,19 +1318,23 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         """Validate video timing and return what prompt and MRoPE need.
 
         Qwen2-VL / Qwen2.5-VL scale the MRoPE time axis by the seconds per
-        temporal patch, which HF derives as ``temporal_patch_size / fps``.
+        temporal patch, which HF derives as ``temporal_patch_size / fps`` from
+        the sampled frame rate. Rows and grid do not determine it, so one of
+        the two is required.
         """
         if item.timestamps is not None or item.frames_indices is not None:
             raise ValueError(
                 f"{type(self).__name__} takes 'second_per_grid_ts' or 'fps' for "
                 "video embeddings, not 'timestamps' / 'frames_indices'")
+        if (item.second_per_grid_ts is None) == (item.fps is None):
+            raise ValueError(
+                f"video embedding of grid {item.grid_thw}: pass exactly one of "
+                "'second_per_grid_ts' or 'fps' (the sampled frame rate)")
         if item.second_per_grid_ts is not None:
             second_per_grid_t = item.second_per_grid_ts
-        elif item.fps is not None:
+        else:
             temporal_patch_size = self.config.vision_config.temporal_patch_size
             second_per_grid_t = temporal_patch_size / item.fps
-        else:
-            second_per_grid_t = 1.0
         return {"second_per_grid_t": second_per_grid_t}
 
     def _expand_external_video_placeholder(self, item: ExternalEmbeddingItem,
