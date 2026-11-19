@@ -165,6 +165,97 @@ def test_repeated_allowed_reducer_rejected_before_load(monkeypatch) -> None:
         load_base64_tensor(payload, max_bytes=_LIMIT)
 
 
+def _rebuild_pickle(rows: int, stride: tuple, storage_numel: int, wrap: bool) -> bytes:
+    """A protocol-2 ``_rebuild_tensor_v2`` pickle of a ``(rows, 2)`` float tensor.
+
+    With ``wrap``, the tensor is passed to ``OrderedDict``, which iterates its rows
+    while unpickling; its hooks are then an empty tuple, keeping the opcode counts
+    of an ordinary ``torch.save`` pickle.
+    """
+
+    def tup(*items: int) -> bytes:
+        return b"(" + b"".join(b"J" + i.to_bytes(4, "little") for i in items) + b"t"
+
+    storage = (
+        b"((X\x07\x00\x00\x00storagectorch\nFloatStorage\nX\x01\x00\x00\x000"
+        b"X\x03\x00\x00\x00cpu" + b"J" + storage_numel.to_bytes(4, "little") + b"tQ"
+    )
+    hooks = b")" if wrap else b"ccollections\nOrderedDict\n)R"
+    rebuild = (
+        b"ctorch._utils\n_rebuild_tensor_v2\n"
+        + storage
+        + b"K\x00"
+        + tup(rows, 2)
+        + tup(*stride)
+        + b"\x89"
+        + hooks
+        + b"tR"
+    )
+    if wrap:
+        return b"\x80\x02ccollections\nOrderedDict\n" + rebuild + b"\x85R."
+    return b"\x80\x02" + rebuild + b"."
+
+
+def _no_load(monkeypatch) -> None:
+    """Fail the test if ``torch.load`` runs."""
+
+    def no_load(*args: object, **kwargs: object) -> None:
+        raise AssertionError("torch.load must not run on a rejected payload")
+
+    monkeypatch.setattr(torch, "load", no_load)
+
+
+def test_reducer_wrapping_tensor_rejected_before_load(monkeypatch) -> None:
+    """``OrderedDict(tensor)`` would unbind 1e8 zero-stride rows; refuse unread."""
+    pickled = _rebuild_pickle(100_000_000, (0, 0), 1, wrap=True)
+    payload = _replace_pickle(_encode(torch.zeros(1)), pickled)
+    _no_load(monkeypatch)
+    with pytest.raises(ValueError, match="rebuild exactly one tensor"):
+        load_base64_tensor(payload, max_bytes=4096)
+
+
+def test_hand_built_pickle_accepted() -> None:
+    """The hand-built rebuild pickle loads when it is well formed."""
+    payload = _replace_pickle(_encode(torch.zeros(8)), _rebuild_pickle(4, (2, 1), 8, wrap=False))
+    assert load_base64_tensor(payload, max_bytes=_LIMIT).shape == (4, 2)
+
+
+def test_view_past_storage_rejected(monkeypatch) -> None:
+    """A size and stride reaching past the stored elements are refused unread."""
+    payload = _replace_pickle(_encode(torch.zeros(8)), _rebuild_pickle(5, (2, 1), 8, wrap=False))
+    _no_load(monkeypatch)
+    with pytest.raises(ValueError, match="past its storage"):
+        load_base64_tensor(payload, max_bytes=_LIMIT)
+
+
+def _add_records(payload: str, names: list) -> str:
+    """Append empty records to a torch.save archive."""
+    src = zipfile.ZipFile(io.BytesIO(base64.b64decode(payload)))
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_STORED) as dst:
+        for info in src.infolist():
+            dst.writestr(info.filename, src.read(info))
+        for name in names:
+            dst.writestr(name, b"")
+    return base64.b64encode(out.getvalue()).decode("ascii")
+
+
+@pytest.mark.parametrize(
+    "names, match",
+    [
+        ([f"junk/{i}" for i in range(20_000)], "too many records"),
+        (["archive/notes"], "only the records"),
+        (["archive/data/1"], "only the records"),
+    ],
+)
+def test_extra_archive_records_rejected(monkeypatch, names: list, match: str) -> None:
+    """Records torch.save does not write, or too many of them, are refused unread."""
+    payload = _add_records(_encode(torch.zeros(2)), names)
+    _no_load(monkeypatch)
+    with pytest.raises(ValueError, match=match):
+        load_base64_tensor(payload, max_bytes=8 << 20)
+
+
 @pytest.mark.parametrize(
     "tensor",
     [
