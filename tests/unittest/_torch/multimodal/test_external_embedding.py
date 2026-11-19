@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+import re
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import Mock, patch
@@ -49,6 +50,32 @@ def _make_tokenizer(input_ids):
     return tokenizer
 
 
+class _PromptTokenizer:
+    """Tokenizes Qwen-VL special tokens by id and other text to one id."""
+
+    _PIECE_RE = re.compile(r"<\|[a-z_]+\|>|[^<]+")
+
+    def __init__(self, config: SimpleNamespace, text_id: int = 5) -> None:
+        self.special_ids = {
+            "<|vision_start|>": config.vision_start_token_id,
+            "<|image_pad|>": config.image_token_id,
+            "<|vision_end|>": config.vision_end_token_id,
+            "<|video_pad|>": config.video_token_id,
+        }
+        self.text_id = text_id
+
+    def __call__(self, text: str, return_tensors: str) -> SimpleNamespace:
+        ids = [
+            self.special_ids.get(piece, self.text_id)
+            for piece in self._PIECE_RE.findall(text)
+        ]
+        return SimpleNamespace(input_ids=torch.tensor([ids]))
+
+    def decode(self, ids: list[int]) -> str:
+        names = {v: k for k, v in self.special_ids.items()}
+        return "".join(names.get(i, "text") for i in ids)
+
+
 def _make_qwen3_vl_processor(
     config: SimpleNamespace,
     tokenizer: Mock,
@@ -74,7 +101,7 @@ def test_qwen3_vl_attach_multimodal_embeddings_builds_mrope_config():
     tokenizer = _make_tokenizer([
         7,
         config.vision_start_token_id,
-        config.image_token_id,
+        *([config.image_token_id] * 4),
         config.vision_end_token_id,
         8,
     ])
@@ -87,7 +114,10 @@ def test_qwen3_vl_attach_multimodal_embeddings_builds_mrope_config():
     ).reshape(num_image_tokens, expected_embedding_width)
 
     prompt_token_ids, extra_processed_inputs = processor.attach_multimodal_embeddings(
-        {"prompt": "Describe this image."},
+        {
+            "prompt":
+            "<|vision_start|><|image_pad|><|vision_end|>Describe this image."
+        },
         {"image": [image_embedding]},
         SamplingParams(),
     )
@@ -105,7 +135,8 @@ def test_qwen3_vl_attach_multimodal_embeddings_builds_mrope_config():
         config.vision_end_token_id,
         8,
     ]
-    tokenizer.assert_called_once_with("Describe this image.",
+    tokenizer.assert_called_once_with("<|vision_start|>" + "<|image_pad|>" * 4 +
+                                      "<|vision_end|>Describe this image.",
                                       return_tensors="pt")
 
     multimodal_data = extra_processed_inputs["multimodal_data"]
@@ -139,12 +170,10 @@ def test_qwen3_vl_attached_embeddings_are_keyed_by_content() -> None:
     config = _make_qwen3_vl_config(hidden_size=4)
     num_levels = 1 + len(config.vision_config.deepstack_visual_indexes)
     width = num_levels * config.text_config.hidden_size
-    vision = (config.vision_start_token_id, config.image_token_id,
-              config.vision_end_token_id)
     # Two back-to-back images of different sizes.
-    processor = _make_qwen3_vl_processor(
-        config, _make_tokenizer([5, *vision, *vision, 6]))
-    inputs = {"prompt": "Compare the two pictures."}
+    processor = _make_qwen3_vl_processor(config, _PromptTokenizer(config))
+    image = "<|vision_start|><|image_pad|><|vision_end|>"
+    inputs = {"prompt": f"Compare {image}{image} pictures."}
     first = torch.full((3, width), 0.5, dtype=torch.bfloat16)
     second = torch.full((2, width), -0.5, dtype=torch.bfloat16)
 
@@ -152,7 +181,7 @@ def test_qwen3_vl_attached_embeddings_are_keyed_by_content() -> None:
     multimodal_input = extra_processed_inputs["multimodal_input"]
     hashes = multimodal_input.multimodal_hashes
 
-    # Prompt: 5 <vs> img*3 <ve> <vs> img*2 <ve> 6.
+    # Prompt: 5 <vs> img*3 <ve> <vs> img*2 <ve> 5.
     assert multimodal_input.multimodal_positions == [2, 7]
     assert multimodal_input.multimodal_lengths == [3, 2]
     assert multimodal_input.multimodal_run_positions == [2, 7]
@@ -176,26 +205,21 @@ def test_qwen3_vl_attached_embedding_uuid_joins_its_hash() -> None:
     config = _make_qwen3_vl_config(hidden_size)
     embedding_width = hidden_size * (
         1 + len(config.vision_config.deepstack_visual_indexes))
-    processor = _make_qwen3_vl_processor(
-        config,
-        _make_tokenizer([
-            7,
-            config.vision_start_token_id,
-            config.image_token_id,
-            config.vision_end_token_id,
-        ]))
+    processor = _make_qwen3_vl_processor(config,
+                                         _PromptTokenizer(config, text_id=7))
     embedding = torch.zeros(4, embedding_width)
+    prompt = "Describe.<|vision_start|><|image_pad|><|vision_end|>"
 
     uuids = {"image": ["user-a"]}
 
-    plain = _attach(processor, {"prompt": "Describe."},
+    plain = _attach(processor, {"prompt": prompt},
                     [embedding])[1]["multimodal_input"]
     with_uuid = _attach(processor, {
-        "prompt": "Describe.",
+        "prompt": prompt,
         "multi_modal_uuids": uuids
     }, [embedding])[1]["multimodal_input"]
     other_uuid = _attach(processor, {
-        "prompt": "Describe.",
+        "prompt": prompt,
         "multi_modal_uuids": {
             "image": ["user-b"]
         }
@@ -203,8 +227,12 @@ def test_qwen3_vl_attached_embedding_uuid_joins_its_hash() -> None:
     # Token IDs are decoded back to text before the hook runs.
     from_token_ids = _attach(
         processor, {
-            "prompt_token_ids": [7, config.vision_start_token_id],
-            "multi_modal_uuids": uuids
+            "prompt_token_ids": [
+                7, config.vision_start_token_id, config.image_token_id,
+                config.vision_end_token_id
+            ],
+            "multi_modal_uuids":
+            uuids
         }, [embedding])[1]["multimodal_input"]
 
     assert plain.multimodal_uuids is None

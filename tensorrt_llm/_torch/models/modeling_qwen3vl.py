@@ -41,6 +41,7 @@ from ...inputs import (
     register_input_processor,
     support_multimodal_disaggregated,
 )
+from ...inputs.external_embeddings import ExternalEmbeddingItem
 from ...inputs.multimodal import (
     MultimodalInputLayout,
     MultimodalItemMetadata,
@@ -345,6 +346,83 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         cfg = self.config.vision_config
         merge_unit = cfg.spatial_merge_size * cfg.spatial_merge_size
         return {"attention": max(1, max_num_tokens // merge_unit)}
+
+    def _external_embedding_width(self) -> int:
+        """Row width of an attached embedding: hidden size times (1 + deepstack levels).
+
+        Deepstack features are concatenated after the main embedding along the
+        last dim, the layout the TRT-LLM vision encoder emits. Checkpoints
+        without deepstack levels (Qwen3.5) take plain hidden-size rows.
+        """
+        levels = getattr(self.config.vision_config, "deepstack_visual_indexes", None)
+        return self.config.text_config.hidden_size * (1 + len(levels or []))
+
+    def _resolve_external_video_metadata(self, item: ExternalEmbeddingItem) -> Dict[str, Any]:
+        """Validate and return the per-temporal-patch timestamps of a video.
+
+        Qwen3-VL prints one ``<t seconds>`` marker per temporal patch. Callers
+        pass the timestamps directly or the sampled ``frames_indices`` with
+        the source ``fps``, from which they are computed like the HF processor.
+        """
+        name = f"video embedding of grid {item.grid_thw}"
+        if item.second_per_grid_ts is not None:
+            raise ValueError(
+                f"{type(self).__name__} takes 'timestamps' or 'fps' + 'frames_indices' "
+                "for video embeddings, not 'second_per_grid_ts'"
+            )
+        grid_t = item.grid_thw[0]
+        if item.timestamps is not None:
+            if item.fps is not None or item.frames_indices is not None:
+                raise ValueError(
+                    f"{name}: pass either 'timestamps' or 'fps' + 'frames_indices', not both"
+                )
+            timestamps = list(item.timestamps)
+        elif item.fps is not None and item.frames_indices is not None:
+            temporal_patch_size = self.config.vision_config.temporal_patch_size
+            indices = list(item.frames_indices)
+            if not indices or any(index < 0 for index in indices):
+                raise ValueError(f"{name}: frames_indices must be non-empty and non-negative")
+            padded = math.ceil(len(indices) / temporal_patch_size) * temporal_patch_size
+            indices.extend([indices[-1]] * (padded - len(indices)))
+            seconds = [index / item.fps for index in indices]
+            timestamps = [
+                (seconds[i] + seconds[i + temporal_patch_size - 1]) / 2
+                for i in range(0, len(seconds), temporal_patch_size)
+            ]
+        else:
+            raise ValueError(
+                f"{name}: Qwen3-VL video embeddings require 'timestamps' "
+                "(one per temporal patch) or 'fps' + 'frames_indices'"
+            )
+        if len(timestamps) != grid_t:
+            raise ValueError(
+                f"{name}: expected {grid_t} timestamps (one per temporal patch), "
+                f"got {len(timestamps)}"
+            )
+        return {"timestamps": timestamps}
+
+    def _external_item_identity(
+        self, grid_thw: Tuple[int, int, int], video_metadata: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Metadata that shapes MRoPE positions without changing the rows.
+
+        Frame timestamps are printed into the prompt, so the prompt tokens
+        already key them; only the grid is added.
+        """
+        return {"grid_thw": list(grid_thw)}
+
+    def _expand_external_video_placeholder(
+        self,
+        item: ExternalEmbeddingItem,
+        video_metadata: Dict[str, Any],
+        framed: bool,
+    ) -> str:
+        """Per-frame timestamped prompt text, as HF's Qwen3-VL processor builds it."""
+        frame_rows = item.num_rows // item.grid_thw[0]
+        frame = self._VISION_START + self._VIDEO_PAD * frame_rows + self._VISION_END
+        return "".join(
+            f"<{timestamp:.1f} seconds>" + frame for timestamp in video_metadata["timestamps"]
+        )
 
     @classmethod
     def get_rope_index(
