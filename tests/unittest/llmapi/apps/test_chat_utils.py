@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1305,17 +1304,3 @@ class TestEmbedsParts:
         assert (await first["data"]).shape == (4096, 8)
         with pytest.raises(ValueError, match="Embedding tensors in this request exceed"):
             await second["data"]
-
-
-@pytest.mark.parametrize(
-    ("messages", "expected"),
-    [
-        ([{"role": "user", "content": "hi"}], False),
-        ([{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}], False),
-        ([{"role": "user", "content": [{"type": "video_embeds", "video_embeds": {}}]}], True),
-        ([SimpleNamespace(content=[SimpleNamespace(type="image_embeds")])], True),
-        ("a plain string input", False),
-    ],
-)
-def test_has_embeds_parts(messages, expected):
-    assert _chat_utils.has_embeds_parts(messages) is expected

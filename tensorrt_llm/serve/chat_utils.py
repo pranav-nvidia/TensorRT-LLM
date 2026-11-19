@@ -88,7 +88,6 @@ VALID_MESSAGE_CONTENT_MM_PART_TYPES = frozenset([
     "video_embeds",
 ])
 
-EMBEDS_PART_TYPES = frozenset({"image_embeds", "video_embeds"})
 MM_EMBEDS_MAX_BYTES_ENV = "TRTLLM_MM_EMBEDS_MAX_BYTES"
 DEFAULT_MM_EMBEDS_MAX_BYTES = 256 * 1024 * 1024
 
@@ -127,26 +126,6 @@ MM_PARSER_MAP: dict[str, Callable[[ChatCompletionContentPartParam], Union[
         "video_embeds":
         lambda part: cast(dict, part).get("video_embeds", None),
     }
-
-
-def has_embeds_parts(messages: Any) -> bool:
-    """Whether any message content part carries precomputed image/video embeddings.
-
-    Accepts chat messages or Responses input items, as dicts or models.
-    """
-    if not isinstance(messages, list):
-        return False
-    for message in messages:
-        content = (message.get("content") if isinstance(message, dict) else
-                   getattr(message, "content", None))
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            part_type = (part.get("type") if isinstance(part, dict) else
-                         getattr(part, "type", None))
-            if part_type in EMBEDS_PART_TYPES:
-                return True
-    return False
 
 
 def mm_embeds_max_bytes() -> int:

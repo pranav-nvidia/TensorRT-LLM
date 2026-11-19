@@ -84,6 +84,21 @@ def _image_embeds_part() -> dict:
     return {"type": "image_embeds", "image_embeds": {"data": encoded}}
 
 
+def _video_embeds_part() -> dict:
+    """One precomputed video embedding with its grid and frame timestamps."""
+    with io.BytesIO() as buf:
+        torch.save(torch.zeros(4, 8), buf)
+        encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+    return {
+        "type": "video_embeds",
+        "video_embeds": {
+            "data": encoded,
+            "video_grid_thw": [1, 4, 4],
+            "timestamps": [0.0],
+        },
+    }
+
+
 def _unreadable_image_part() -> dict:
     """An image reference that raises if anything tries to load it."""
     return {
@@ -95,6 +110,7 @@ def _unreadable_image_part() -> dict:
 MEDIA_PARTS = {
     "image_url": (_image_url_part, "multi_modal_data"),
     "image_embeds": (_image_embeds_part, "multi_modal_embeddings"),
+    "video_embeds": (_video_embeds_part, "multi_modal_embeddings"),
 }
 
 
@@ -172,13 +188,14 @@ def _post(route_client, media_kind: str, disaggregated_params: dict | None):
     return prompt
 
 
-def test_generation_only_drops_relayed_media(route_client):
+@pytest.mark.parametrize("media_kind", sorted(MEDIA_PARTS))
+def test_generation_only_drops_relayed_media(route_client, media_kind):
     """The generation worker gets the ids and none of the media.
 
     Both keys, not just one: `LLM._preprocess` takes its generation-only
     branch only when neither is attached.
     """
-    prompt = _post(route_client, "image_url", {"request_type": "generation_only"})
+    prompt = _post(route_client, media_kind, {"request_type": "generation_only"})
 
     assert "multi_modal_data" not in prompt
     assert "multi_modal_embeddings" not in prompt
@@ -202,34 +219,13 @@ def test_generation_only_never_loads_relayed_media(route_client):
     assert "multi_modal_data" not in captured["inputs"]
 
 
-def test_context_only_keeps_media(route_client):
+@pytest.mark.parametrize("media_kind", sorted(MEDIA_PARTS))
+def test_context_only_keeps_media(route_client, media_kind):
     """The context worker is the one that expands, so it keeps its media."""
-    prompt = _post(route_client, "image_url", {"request_type": "context_only"})
+    _, prompt_key = MEDIA_PARTS[media_kind]
+    prompt = _post(route_client, media_kind, {"request_type": "context_only"})
 
-    assert prompt["multi_modal_data"]
-
-
-@pytest.mark.parametrize("request_type", ["context_only", "generation_only"])
-@pytest.mark.parametrize("relayed_ids_b64", [False, True])
-def test_disaggregated_requests_reject_precomputed_embeddings(
-    route_client, request_type, relayed_ids_b64
-):
-    """Disaggregated requests do not carry the embeddings' cache identity.
-
-    A generation-only worker would otherwise drop the parts unread.
-    """
-    client, captured = route_client
-    body = _chat_body("image_embeds", {"request_type": request_type})
-    if relayed_ids_b64:
-        ids = body.pop("prompt_token_ids")
-        body["prompt_token_ids_b64"] = base64.b64encode(
-            torch.tensor(ids, dtype=torch.int32).numpy().tobytes()
-        ).decode()
-    response = client.post("/v1/chat/completions", json=body)
-
-    assert response.status_code == 400, response.text
-    assert "not supported with disaggregated serving" in response.text
-    assert "inputs" not in captured
+    assert prompt[prompt_key]
 
 
 @pytest.mark.parametrize("media_kind", sorted(MEDIA_PARTS))

@@ -76,7 +76,6 @@ from tensorrt_llm.llmapi.thinking_budget import \
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.chat_utils import (VALID_MESSAGE_CONTENT_MM_PART_TYPES,
-                                           has_embeds_parts,
                                            parse_chat_messages_coroutines,
                                            resolve_top_level_model_type)
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
@@ -1749,10 +1748,6 @@ async def request_preprocess(
         for msg in prev_msgs:
             _responses_debug_log(f" -> {msg}")
 
-    if (request.disaggregated_params is not None
-            and has_embeds_parts(request.input)):
-        raise ValueError("image_embeds/video_embeds are not supported with "
-                         "disaggregated serving.")
     # A generation worker in disaggregated serving gets the context worker's
     # tokens: rendering again could produce a prompt that was never prefilled.
     pretokenized = request.relayed_prompt_token_ids()
