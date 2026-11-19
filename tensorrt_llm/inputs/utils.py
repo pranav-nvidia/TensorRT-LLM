@@ -253,6 +253,11 @@ def _check_tensor_archive(content: bytes, max_bytes: int) -> None:
                 raise ValueError(
                     "Tensor payload archive must hold only the records "
                     "torch.save writes for one tensor.")
+            # zipfile shifts every offset by any bytes before the first
+            # record; torch.load does not, so it would read other records.
+            if min(m.header_offset for m in members) != 0:
+                raise ValueError(
+                    "Tensor payload archive must start with its first record.")
             total = 0
             for member in members:
                 if member.compress_type != zipfile.ZIP_STORED:
