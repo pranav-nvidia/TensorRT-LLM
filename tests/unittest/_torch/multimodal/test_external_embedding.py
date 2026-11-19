@@ -12,8 +12,11 @@ from tensorrt_llm._torch.models.modeling_llava_next import \
     LlavaNextInputProcessor
 from tensorrt_llm._torch.models.modeling_qwen3vl import \
     Qwen3VLInputProcessorBase
-from tensorrt_llm.inputs.multimodal import MultimodalInput
-from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
+    MultimodalItemMetadata)
+from tensorrt_llm.inputs.registry import (ATTACHED_ITEM_IDENTITIES_KEY,
+                                          BaseMultimodalInputProcessor)
 from tensorrt_llm.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.cpu_only
@@ -223,6 +226,49 @@ class _NoItemMetadataProcessor(Qwen3VLInputProcessorBase):
                 "multimodal_embedding": multimodal_embedding["image"]
             }
         }
+
+
+class _IdentityProcessor(Qwen3VLInputProcessorBase):
+    """Attaches one image and publishes the caller's identity for it."""
+
+    def _attach_multimodal_embeddings_impl(
+            self, inputs: dict[str, Any], multimodal_embedding: dict[str, Any],
+            sampling_params: SamplingParams
+    ) -> tuple[list[int], dict[str, Any]]:
+        rows = multimodal_embedding["image"][0]
+        extra = {
+            "multimodal_data": {
+                "multimodal_embedding": [rows],
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY:
+                MultimodalItemMetadata([("image", 0)],
+                                       output_embedding_lengths=[len(rows)]),
+            }
+        }
+        if "identities" in inputs:
+            extra[ATTACHED_ITEM_IDENTITIES_KEY] = inputs["identities"]
+        return [7] + [self.config.image_token_id] * len(rows), extra
+
+
+def test_attached_item_identity_joins_its_hash() -> None:
+    config = _make_qwen3_vl_config(8)
+    processor = _make_qwen3_vl_processor(config,
+                                         _make_tokenizer([7]),
+                                         processor_cls=_IdentityProcessor)
+    rows = torch.zeros(4, 16)
+
+    def hashes(**inputs: Any) -> list[list[int]]:
+        extra = _attach(processor, {"prompt": "Describe.", **inputs}, [rows])[1]
+        assert ATTACHED_ITEM_IDENTITIES_KEY not in extra
+        return extra["multimodal_input"].multimodal_hashes
+
+    plain = hashes()
+    assert hashes(identities=[None]) == plain
+    square = hashes(identities=[{"grid": (1, 4, 4)}])
+    assert square != plain
+    assert hashes(identities=[{"grid": (1, 4, 4)}]) == square
+    assert hashes(identities=[{"grid": (1, 2, 8)}]) != square
+    with pytest.raises(ValueError, match="2 attached item identities for 1"):
+        hashes(identities=[None, None])
 
 
 def test_attached_embeddings_require_item_metadata() -> None:

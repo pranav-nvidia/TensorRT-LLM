@@ -23,7 +23,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, Iterator, List, Mapping,
-                    Optional, Protocol, Tuple, Type, TypeVar, Union)
+                    Optional, Protocol, Sequence, Tuple, Type, TypeVar, Union)
 
 import numpy as np
 import torch
@@ -63,6 +63,11 @@ if TYPE_CHECKING:
 N = TypeVar("N", bound=Type[nn.Module])
 
 ExtraProcessedInputs = Dict[str, Any]
+
+# Optional entry of the extra inputs an attach hook returns: one value per
+# prompt-ordered item (or None) for metadata that shapes the request without
+# changing the embedding rows, such as a grid that drives MRoPE positions.
+ATTACHED_ITEM_IDENTITIES_KEY = "attached_item_identities"
 
 
 def _hash_mm_processor_kwargs(mm_processor_kwargs: Dict[str, Any],
@@ -365,7 +370,8 @@ class BaseMultimodalInputProcessor(ABC):
 
         The returned `multimodal_input` keys each attached item by the content
         of its embedding rows, as `apply_mm_hashes` keys media items, so KV-cache
-        reuse matches only identical embeddings.
+        reuse matches only identical embeddings. Values the hook returns under
+        `ATTACHED_ITEM_IDENTITIES_KEY` join each item's hash.
         """
         # Detokenizing rebuilds the prompt without the caller's UUIDs.
         multimodal_uuids = inputs.get("multi_modal_uuids")
@@ -383,6 +389,8 @@ class BaseMultimodalInputProcessor(ABC):
                     prompt_token_ids,
                     extra_processed_inputs["multimodal_data"],
                     multimodal_uuids,
+                    extra_processed_inputs.pop(ATTACHED_ITEM_IDENTITIES_KEY,
+                                               None),
                 ))
         return prompt_token_ids, extra_processed_inputs
 
@@ -391,6 +399,7 @@ class BaseMultimodalInputProcessor(ABC):
         prompt_token_ids: list[int],
         multimodal_data: dict[str, Any],
         multimodal_uuids: dict[str, list[str | None]] | None,
+        item_identities: Sequence[Any] | None = None,
     ) -> MultimodalInput:
         """Hash each attached item and locate it in the prompt.
 
@@ -404,6 +413,9 @@ class BaseMultimodalInputProcessor(ABC):
                 `multimodal_embedding`: one `[rows, hidden]` tensor per item, or
                 all items concatenated along rows.
             multimodal_uuids: Optional user-provided UUIDs per modality.
+            item_identities: Optional prompt-ordered values hashed with each
+                item's rows, for metadata that changes positions or inputs but
+                not the rows; None entries hash the rows alone.
 
         Returns:
             Hashes, prompt positions, lengths and runs of the attached items.
@@ -420,13 +432,25 @@ class BaseMultimodalInputProcessor(ABC):
         if isinstance(embeddings, torch.Tensor):
             embeddings = torch.split(embeddings, item_lengths)
 
+        if item_identities is None:
+            item_identities = [None] * len(item_refs)
+        elif len(item_identities) != len(item_refs):
+            raise ValueError(
+                f"{type(self).__name__} returned {len(item_identities)} "
+                f"attached item identities for {len(item_refs)} items")
+
         # apply_mm_hashes takes each modality's items in modality-local order.
-        rows_by_modality: dict[str, list[torch.Tensor]] = {}
-        for (modality, _), rows in sorted(zip(item_refs,
-                                              embeddings,
-                                              strict=True),
-                                          key=lambda item: item[0]):
-            rows_by_modality.setdefault(modality, []).append(rows)
+        rows_by_modality: dict[str, list[Any]] = {}
+        for (modality, _), rows, identity in sorted(zip(item_refs,
+                                                        embeddings,
+                                                        item_identities,
+                                                        strict=True),
+                                                    key=lambda item: item[0]):
+            rows_by_modality.setdefault(
+                modality, []).append(rows if identity is None else {
+                    "rows": rows,
+                    "identity": identity
+                })
         mm_hashes = apply_mm_hashes(rows_by_modality, multimodal_uuids)
         hashes = [mm_hashes.hashes[m][i] for m, i in item_refs]
         uuids = (None if mm_hashes.uuids is None else
@@ -467,7 +491,8 @@ class BaseMultimodalInputProcessor(ABC):
         rather than the wrapper `attach_multimodal_embeddings` itself. The
         returned `multimodal_data` holds `multimodal_embedding` and a
         `MultimodalItemMetadata` record whose `output_embedding_lengths` give
-        each item's embedding rows in prompt order.
+        each item's embedding rows in prompt order. The extra inputs may also
+        hold `ATTACHED_ITEM_IDENTITIES_KEY`; see `_key_attached_embeddings`.
         Default raises NotImplementedError.
         """
         raise NotImplementedError(
