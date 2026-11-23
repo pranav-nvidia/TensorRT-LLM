@@ -261,6 +261,12 @@ def remap_prompt_embeds(
             while segment_end < len(original_ids) and original_ids[segment_end] != token:
                 segment_end += 1
             if segment_end == len(original_ids):
+                if token not in original_ids:
+                    raise ValueError(
+                        "This model expands its multimodal placeholder into different "
+                        "token ids, so prompt_embeds cannot be combined with "
+                        "multimodal data for it."
+                    )
                 _raise_unaligned()
         segment = original_ids[len(mapping) : segment_end]
         mapping.extend(_align_gap(segment, expanded_ids, gap_start, start, framed=is_item))

@@ -179,6 +179,9 @@ def test_remap_through_placeholder_expansion() -> None:
         remap_prompt_embeds(on_image, original, expanded, spans)
     with pytest.raises(ValueError, match="did not survive"):
         remap_prompt_embeds(pe, original, [1, 50, 51, 51, 51, 52, 2, 9, 3], spans)
+    # Llama4-style expansion: the placeholder becomes rows of another id.
+    with pytest.raises(ValueError, match="different token ids"):
+        remap_prompt_embeds(pe, original, [1, 50, 70, 70, 70, 52, 2, 3], spans)
 
 
 # Video notation: 50/52 = vision start/end, 53 = video placeholder rows,
