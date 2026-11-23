@@ -5,6 +5,7 @@ import asyncio
 import base64
 import binascii
 import pickletools
+import struct
 import zipfile
 from collections import defaultdict
 from io import BytesIO
@@ -92,8 +93,12 @@ _TENSOR_PICKLE_OPS = frozenset({
 })
 # A single tensor's pickle is about 160 bytes.
 _TENSOR_PICKLE_MAX_BYTES = 4096
-# torch.save writes seven records for one tensor.
-_TENSOR_ARCHIVE_MAX_RECORDS = 16
+# torch.save writes seven records for one tensor, about 600 bytes of central
+# directory; zipfile parses all of it up front.
+_TENSOR_ARCHIVE_MAX_DIRECTORY_BYTES = 4096
+_ZIP_EOCD = struct.Struct("<4s4x2H2IH")
+_ZIP64_EOCD = struct.Struct("<4s36xQQ")
+_BASE64_WHITESPACE = str.maketrans("", "", " \t\r\n")
 _TENSOR_ARCHIVE_RECORDS = frozenset({
     "data.pkl", "byteorder", "version", ".format_version", ".storage_alignment",
     ".data/version", ".data/serialization_id"
@@ -224,6 +229,11 @@ def _check_tensor_pickle(pickled: bytes, max_bytes: int) -> _TensorSpec:
             and _is_int_tuple(stride) and len(size) == len(stride)
             and isinstance(requires_grad, bool) and pid[4] >= 0):
         raise malformed
+    # A zero-sized dim or a size-1 dim leaves other values out of the extent
+    # check below; bound them so as_strided never sees an overflowing value.
+    if max((offset, *size, *stride)) > max_bytes:
+        raise ValueError(
+            f"Tensor payload size, stride or offset exceeds {max_bytes}.")
     storage_bytes = pid[4] * element_size
     logical_bytes = element_size
     for dim in size:
@@ -239,8 +249,36 @@ def _check_tensor_pickle(pickled: bytes, max_bytes: int) -> _TensorSpec:
     return _TensorSpec(pid[2], dtype, pid[4], offset, size, stride)
 
 
+def _check_central_directory_size(content: bytes) -> None:
+    """Bound the central directory zipfile will parse, as torch.save writes it.
+
+    torch.save ends the archive with a comment-free end-of-central-directory
+    record, preceded by a zip64 one. Like zipfile, the directory size is taken
+    from the zip64 record when its locator is present (large archives store a
+    placeholder in the plain record).
+    """
+    tail = content[-_ZIP_EOCD.size:]
+    if len(tail) < _ZIP_EOCD.size:
+        raise ValueError("Tensor payload must be a torch.save zip archive.")
+    signature, _, _, size, _, comment = _ZIP_EOCD.unpack(tail)
+    if signature != b"PK\x05\x06" or comment:
+        raise ValueError("Tensor payload must end with a torch.save zip "
+                         "directory record and no comment.")
+    locator = len(content) - _ZIP_EOCD.size - 20
+    if content[locator:locator + 4] == b"PK\x06\x07":
+        record = content[max(locator - _ZIP64_EOCD.size, 0):locator]
+        if (len(record) != _ZIP64_EOCD.size
+                or _ZIP64_EOCD.unpack(record)[0] != b"PK\x06\x06"):
+            raise ValueError("Tensor payload zip64 directory record is "
+                             "malformed.")
+        size = _ZIP64_EOCD.unpack(record)[1]
+    if size > _TENSOR_ARCHIVE_MAX_DIRECTORY_BYTES:
+        raise ValueError(f"Tensor payload archive's central directory is over "
+                         f"{_TENSOR_ARCHIVE_MAX_DIRECTORY_BYTES} bytes.")
+
+
 def _read_tensor_archive(content: bytes,
-                         max_bytes: int) -> Tuple[_TensorSpec, bytes]:
+                         max_bytes: int) -> Tuple[_TensorSpec, bytearray]:
     """Check a ``torch.save`` archive of one tensor and read its storage.
 
     Only the zip format with the records ``torch.save`` writes for one tensor,
@@ -248,12 +286,9 @@ def _read_tensor_archive(content: bytes,
     rebuild one float16, bfloat16 or float32 tensor.
 
     Returns:
-        The tensor's fields and its storage record's bytes.
+        The tensor's fields and its storage record's bytes, writable.
     """
-    # ZipFile parses every central directory record up front, and each starts
-    # with this signature, so its count bounds that work.
-    if content.count(b"PK\x01\x02") > _TENSOR_ARCHIVE_MAX_RECORDS:
-        raise ValueError("Tensor payload archive has too many records.")
+    _check_central_directory_size(content)
     try:
         with zipfile.ZipFile(BytesIO(content)) as archive:
             members = archive.infolist()
@@ -289,8 +324,18 @@ def _read_tensor_archive(content: bytes,
             if (prefix + "byteorder" in names
                     and archive.read(prefix + "byteorder") != b"little"):
                 raise ValueError("Tensor payload must be little-endian.")
-            # zipfile checks the record's CRC while reading it.
-            storage = archive.read(prefix + data[0])
+            # Copy in chunks into the tensor's buffer, so no second full copy
+            # exists; zipfile checks the record's CRC once all of it is read.
+            storage = bytearray(storage_bytes)
+            view, filled = memoryview(storage), 0
+            with archive.open(prefix + data[0]) as record:
+                while chunk := record.read(1 << 20):
+                    if filled + len(chunk) > storage_bytes:
+                        break
+                    view[filled:filled + len(chunk)] = chunk
+                    filled += len(chunk)
+            if filled != storage_bytes:
+                raise ValueError("Tensor payload storage record is truncated.")
     except ValueError:
         raise
     except Exception as e:
@@ -305,12 +350,14 @@ def load_base64_tensor(data: str, *, max_bytes: int) -> torch.Tensor:
     """Decode one dense tensor from base64-encoded ``torch.save`` bytes.
 
     The payload is never unpickled: its archive and pickle are checked and the
-    tensor is built from the checked fields, so nothing allocated here exceeds
-    ``max_bytes``, nor does the tensor's logical size. Only little-endian
+    tensor is built from the checked fields. The tensor's logical size is at
+    most ``max_bytes``, and peak allocation here is about twice the decoded
+    payload (the payload plus the tensor's storage). Only little-endian
     float16, bfloat16 and float32 tensors load. Callers check shape.
 
     Args:
-        data: Standard base64 text (no line breaks) of a ``torch.save`` file.
+        data: Standard base64 text of a ``torch.save`` file; ASCII whitespace
+            such as line breaks is ignored.
         max_bytes: Upper bound on the decoded payload size.
 
     Returns:
@@ -324,14 +371,24 @@ def load_base64_tensor(data: str, *, max_bytes: int) -> torch.Tensor:
             f"Tensor payload is {len(data)} base64 characters, over the "
             f"{max_bytes}-byte limit.")
     try:
-        content = base64.b64decode(data, validate=True)
+        # Unlike base64.b64decode, this does not first copy the text to bytes.
+        content = binascii.a2b_base64(data, strict_mode=True)
     except binascii.Error as e:
-        raise ValueError(f"Tensor payload is not valid base64: {e}") from e
+        # Line-wrapped base64 (MIME style) is accepted; only then is the text
+        # copied without its whitespace.
+        stripped, content = data.translate(_BASE64_WHITESPACE), None
+        if stripped != data:
+            try:
+                content = binascii.a2b_base64(stripped, strict_mode=True)
+            except binascii.Error:
+                pass
+        if content is None:
+            raise ValueError(f"Tensor payload is not valid base64: {e}") from e
     if len(content) > max_bytes:
         raise ValueError(f"Tensor payload is {len(content)} bytes, over the "
                          f"{max_bytes}-byte limit.")
     spec, storage = _read_tensor_archive(content, max_bytes)
-    flat = (torch.frombuffer(bytearray(storage), dtype=spec.dtype)
+    flat = (torch.frombuffer(storage, dtype=spec.dtype)
             if storage else torch.empty(0, dtype=spec.dtype))
     return flat.as_strided(spec.size, spec.stride, spec.offset)
 
