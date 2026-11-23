@@ -391,6 +391,9 @@ def load_base64_tensor(data: str, *, max_bytes: int) -> torch.Tensor:
         raise ValueError(
             f"Tensor payload is {len(data)} base64 characters, over the "
             f"{max_bytes}-byte limit.")
+    # Base64 is ASCII; checked first because translate() is slow on other text.
+    if not data.isascii():
+        raise ValueError("Tensor payload is not valid base64: non-ASCII text.")
     try:
         content = _b64decode_strict(data)
     except ValueError as e:
