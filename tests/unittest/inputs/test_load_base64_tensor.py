@@ -68,7 +68,7 @@ def test_decoded_size_over_limit() -> None:
         load_base64_tensor("AAAA", max_bytes=2)
 
 
-@pytest.mark.parametrize("payload", ["not base64!", "QUJD\nRE!G"])
+@pytest.mark.parametrize("payload", ["not base64!", "QUJD\nRE!G", "QUJD\u00e9"])
 def test_invalid_base64(payload: str) -> None:
     """Non-alphabet characters are rejected, with or without line breaks."""
     with pytest.raises(ValueError, match="not valid base64"):
