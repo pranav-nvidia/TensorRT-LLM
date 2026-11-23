@@ -6,6 +6,7 @@ import base64
 import binascii
 import pickletools
 import struct
+import sys
 import zipfile
 from collections import defaultdict
 from io import BytesIO
@@ -98,6 +99,7 @@ _TENSOR_PICKLE_MAX_BYTES = 4096
 _TENSOR_ARCHIVE_MAX_DIRECTORY_BYTES = 4096
 _ZIP_EOCD = struct.Struct("<4s4x2H2IH")
 _ZIP64_EOCD = struct.Struct("<4s36xQQ")
+_ZIP64_LOCATOR = struct.Struct("<4s4xQ4x")
 _BASE64_WHITESPACE = str.maketrans("", "", " \t\r\n")
 _TENSOR_ARCHIVE_RECORDS = frozenset({
     "data.pkl", "byteorder", "version", ".format_version", ".storage_alignment",
@@ -264,8 +266,15 @@ def _check_central_directory_size(content: bytes) -> None:
     if signature != b"PK\x05\x06" or comment:
         raise ValueError("Tensor payload must end with a torch.save zip "
                          "directory record and no comment.")
-    locator = len(content) - _ZIP_EOCD.size - 20
+    locator = len(content) - _ZIP_EOCD.size - _ZIP64_LOCATOR.size
     if content[locator:locator + 4] == b"PK\x06\x07":
+        # zipfile reads the zip64 record where the locator points (newer
+        # versions) or right before the locator (older ones); torch.save
+        # writes it right before, so require both to be the same record.
+        if (_ZIP64_LOCATOR.unpack_from(content, locator)[1]
+                != locator - _ZIP64_EOCD.size):
+            raise ValueError("Tensor payload zip64 directory record must "
+                             "directly precede its locator.")
         record = content[max(locator - _ZIP64_EOCD.size, 0):locator]
         if (len(record) != _ZIP64_EOCD.size
                 or _ZIP64_EOCD.unpack(record)[0] != b"PK\x06\x06"):
@@ -346,6 +355,14 @@ def _read_tensor_archive(content: bytes,
     return spec, storage
 
 
+def _b64decode_strict(text: str) -> bytes:
+    """Decode standard base64, rejecting characters outside its alphabet."""
+    if sys.version_info >= (3, 11):
+        # Unlike base64.b64decode, this does not first copy the text to bytes.
+        return binascii.a2b_base64(text, strict_mode=True)
+    return base64.b64decode(text, validate=True)
+
+
 def load_base64_tensor(data: str, *, max_bytes: int) -> torch.Tensor:
     """Decode one dense tensor from base64-encoded ``torch.save`` bytes.
 
@@ -366,21 +383,22 @@ def load_base64_tensor(data: str, *, max_bytes: int) -> torch.Tensor:
     if not isinstance(data, str):
         raise TypeError(f"Tensor payload must be a base64 string, got "
                         f"{type(data).__name__}.")
-    if len(data) > 4 * ((max_bytes + 2) // 3):
+    encoded_limit = 4 * ((max_bytes + 2) // 3)
+    # Line-wrapped (MIME style) text adds up to two characters per 76.
+    if len(data) > encoded_limit + encoded_limit // 38 + 2:
         raise ValueError(
             f"Tensor payload is {len(data)} base64 characters, over the "
             f"{max_bytes}-byte limit.")
     try:
-        # Unlike base64.b64decode, this does not first copy the text to bytes.
-        content = binascii.a2b_base64(data, strict_mode=True)
-    except binascii.Error as e:
-        # Line-wrapped base64 (MIME style) is accepted; only then is the text
-        # copied without its whitespace.
+        content = _b64decode_strict(data)
+    except ValueError as e:
+        # Line-wrapped base64 is accepted; only then is the text copied
+        # without its whitespace.
         stripped, content = data.translate(_BASE64_WHITESPACE), None
-        if stripped != data:
+        if stripped != data and len(stripped) <= encoded_limit:
             try:
-                content = binascii.a2b_base64(stripped, strict_mode=True)
-            except binascii.Error:
+                content = _b64decode_strict(stripped)
+            except ValueError:
                 pass
         if content is None:
             raise ValueError(f"Tensor payload is not valid base64: {e}") from e
