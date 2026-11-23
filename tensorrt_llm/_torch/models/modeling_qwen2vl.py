@@ -1299,8 +1299,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             llm_grid_w * spatial_merge_size,
         ]
 
-    # Qwen-VL prompt placeholders for one image or video item. A video may be
-    # written bare or framed by vision start / end, as the HF processors accept.
+    # Qwen-VL prompt placeholders for one image or video item. A video is
+    # framed by vision start / end; Qwen3-VL also accepts it bare.
     _EXTERNAL_PLACEHOLDER_RE = re.compile(
         r"(?P<framed_video><\|vision_start\|><\|video_pad\|><\|vision_end\|>)"
         r"|(?P<video><\|video_pad\|>)|(?P<image><\|image_pad\|>)")
@@ -1340,10 +1340,17 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
     def _expand_external_video_placeholder(self, item: ExternalEmbeddingItem,
                                            video_metadata: Dict[str, Any],
                                            framed: bool) -> str:
-        """Prompt text for one video, as the HF processor expands it."""
-        pads = self._VIDEO_PAD * item.num_rows
-        return (self._VISION_START + pads +
-                self._VISION_END) if framed else pads
+        """Prompt text for one video, as the HF processor expands it.
+
+        MRoPE gives video positions only to pads that follow vision start, so
+        a bare placeholder is rejected rather than given text positions.
+        """
+        if not framed:
+            raise ValueError(
+                f"{type(self).__name__} needs video placeholders framed as "
+                "<|vision_start|><|video_pad|><|vision_end|>")
+        return (self._VISION_START + self._VIDEO_PAD * item.num_rows +
+                self._VISION_END)
 
     def _external_item_identity(
             self, grid_thw: Tuple[int, int, int],

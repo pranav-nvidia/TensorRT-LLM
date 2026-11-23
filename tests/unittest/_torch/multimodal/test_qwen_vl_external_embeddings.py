@@ -247,6 +247,12 @@ def test_qwen2_5_video_requires_one_time_scale(timing, match):
         _attach(processor, "<|video_pad|>", {"video": [_video(2, 2, 2, **timing)]})
 
 
+def test_qwen2_5_bare_video_placeholder_is_rejected():
+    processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
+    with pytest.raises(ValueError, match="framed"):
+        _attach(processor, "<|video_pad|>", {"video": [_video(2, 2, 2, fps=2.0)]})
+
+
 @pytest.mark.parametrize(
     "embeddings, prompt, match",
     [
