@@ -7,7 +7,9 @@ import base64
 import collections
 import io
 import pickle
+import struct
 import zipfile
+import zlib
 
 import pytest
 import torch
@@ -151,18 +153,126 @@ def test_sparse_rejected() -> None:
         load_base64_tensor(_encode(sparse), max_bytes=_LIMIT)
 
 
-def test_repeated_allowed_reducer_rejected_before_load(monkeypatch) -> None:
-    """Copies of one memoized dict through OrderedDict amplify memory; refuse unread."""
+def test_repeated_allowed_reducer_rejected() -> None:
+    """Copies of one memoized dict through OrderedDict are not one tensor's pickle."""
     shared = {i: i for i in range(16)}
     copies = [collections.OrderedDict(shared) for _ in range(8)]
     payload = _replace_pickle(_encode(torch.zeros(2)), pickle.dumps(copies, protocol=2))
-
-    def no_load(*args: object, **kwargs: object) -> None:
-        raise AssertionError("torch.load must not run on a rejected payload")
-
-    monkeypatch.setattr(torch, "load", no_load)
     with pytest.raises(ValueError, match="unsupported pickle opcode"):
         load_base64_tensor(payload, max_bytes=_LIMIT)
+
+
+def test_payload_is_never_unpickled(monkeypatch) -> None:
+    """The tensor is built from checked fields; client bytes never reach torch.load."""
+
+    def no_load(*args: object, **kwargs: object) -> None:
+        raise AssertionError("torch.load must not run on client bytes")
+
+    monkeypatch.setattr(torch, "load", no_load)
+    tensor = torch.randn(3, 4)
+    assert torch.equal(load_base64_tensor(_encode(tensor), max_bytes=_LIMIT), tensor)
+
+
+@pytest.mark.parametrize("protocol", [2, 3, 4, 5])
+def test_pickle_protocols_accepted(protocol: int) -> None:
+    """torch.save with a newer pickle protocol (STACK_GLOBAL, framing) still decodes."""
+    tensor = torch.randn(2, 3)
+    payload = _encode(tensor, pickle_protocol=protocol)
+    assert torch.equal(load_base64_tensor(payload, max_bytes=_LIMIT), tensor)
+
+
+def _zip_member(name: str, data: bytes, offset: int, method: int = 0, size: int = 0) -> tuple:
+    """Local and central directory headers of one record (``size`` for deflated data)."""
+    raw = name.encode()
+    crc = zlib.crc32(data if not method else bytes(size)) & 0xFFFFFFFF
+    usize = size or len(data)
+    local = struct.pack(
+        "<IHHHHHIIIHH", 0x04034B50, 20, 0, method, 0, 0, crc, len(data), usize, len(raw), 0
+    )
+    central = struct.pack(
+        "<IHHHHHHIIIHHHHHII",
+        0x02014B50,
+        20,
+        20,
+        0,
+        method,
+        0,
+        0,
+        crc,
+        len(data),
+        usize,
+        len(raw),
+        0,
+        0,
+        0,
+        0,
+        0,
+        offset,
+    )
+    return local + raw + data, central + raw
+
+
+def _benign_members() -> list:
+    """The records torch.save writes for ``zeros(2, 2)``."""
+    src = zipfile.ZipFile(io.BytesIO(base64.b64decode(_encode(torch.zeros(2, 2)))))
+    return [(info.filename, src.read(info)) for info in src.infolist()]
+
+
+def test_legacy_stream_before_zip_ignored() -> None:
+    """A legacy torch.save stream at byte 0 ahead of a valid zip is never read."""
+    legacy = io.BytesIO()
+    torch.save(torch.arange(4), legacy, _use_new_zipfile_serialization=False)
+    body, central = bytearray(legacy.getvalue()), bytearray()
+    for name, data in _benign_members():
+        # The version record claims offset 0, where torch.load would see the legacy magic.
+        local, entry = _zip_member(name, data, 0 if name.endswith("/version") else len(body))
+        body += local
+        central += entry
+    count = len(_benign_members())
+    eocd = struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, count, count, len(central), len(body), 0)
+    payload = base64.b64encode(bytes(body + central + eocd)).decode()
+    decoded = load_base64_tensor(payload, max_bytes=_LIMIT)
+    assert decoded.dtype == torch.float32 and torch.equal(decoded, torch.zeros(2, 2))
+
+
+def test_hidden_central_directory_ignored() -> None:
+    """A second central directory, reachable only through stored offsets, is never read.
+
+    The EOCD overstates the central directory size, so zipfile reads the benign one
+    shifted back while miniz would read one hidden in the last entry's comment,
+    pointing at a deflated 16 MiB storage. The decoder reads only zipfile's view.
+    """
+    hidden_numel = 4 << 20
+    pickled = _rebuild_pickle(hidden_numel // 2, (2, 1), hidden_numel, wrap=False)
+    deflate = zlib.compressobj(9, zlib.DEFLATED, -15)
+    compressed = deflate.compress(bytes(4 * hidden_numel)) + deflate.flush()
+    body, visible, hidden = bytearray(), [], b""
+    for name, data in _benign_members():
+        visible.append((name, data, len(body)))
+        body += _zip_member(name, data, 0)[0]
+    for name, data, method, size in [
+        ("archive/data.pkl", pickled, 0, 0),
+        ("archive/version", b"3\n", 0, 0),
+        ("archive/data/0", compressed, 8, 4 * hidden_numel),
+    ]:
+        local, entry = _zip_member(name, data, len(body), method, size)
+        hidden += entry
+        body += local
+    entries = [_zip_member(name, data, 0)[1] for name, data, _ in visible]
+    shift = sum(len(e) for e in entries)
+    central = b""
+    for i, (name, data, offset) in enumerate(visible):
+        entry = bytearray(_zip_member(name, data, offset + shift)[1])
+        if i == len(visible) - 1:
+            entry[32:34] = struct.pack("<H", len(hidden))
+            entry += hidden
+        central += bytes(entry)
+    eocd = struct.pack(
+        "<IHHHHIIH", 0x06054B50, 0, 0, 3, 3, len(central), len(body) + shift, shift
+    ) + bytes(shift)
+    payload = base64.b64encode(bytes(body) + central + eocd).decode()
+    decoded = load_base64_tensor(payload, max_bytes=_LIMIT)
+    assert torch.equal(decoded, torch.zeros(2, 2))
 
 
 def _rebuild_pickle(rows: int, stride: tuple, storage_numel: int, wrap: bool) -> bytes:
@@ -196,20 +306,10 @@ def _rebuild_pickle(rows: int, stride: tuple, storage_numel: int, wrap: bool) ->
     return b"\x80\x02" + rebuild + b"."
 
 
-def _no_load(monkeypatch) -> None:
-    """Fail the test if ``torch.load`` runs."""
-
-    def no_load(*args: object, **kwargs: object) -> None:
-        raise AssertionError("torch.load must not run on a rejected payload")
-
-    monkeypatch.setattr(torch, "load", no_load)
-
-
-def test_reducer_wrapping_tensor_rejected_before_load(monkeypatch) -> None:
+def test_reducer_wrapping_tensor_rejected() -> None:
     """``OrderedDict(tensor)`` would unbind 1e8 zero-stride rows; refuse unread."""
     pickled = _rebuild_pickle(100_000_000, (0, 0), 1, wrap=True)
     payload = _replace_pickle(_encode(torch.zeros(1)), pickled)
-    _no_load(monkeypatch)
     with pytest.raises(ValueError, match="rebuild exactly one tensor"):
         load_base64_tensor(payload, max_bytes=4096)
 
@@ -220,10 +320,9 @@ def test_hand_built_pickle_accepted() -> None:
     assert load_base64_tensor(payload, max_bytes=_LIMIT).shape == (4, 2)
 
 
-def test_view_past_storage_rejected(monkeypatch) -> None:
+def test_view_past_storage_rejected() -> None:
     """A size and stride reaching past the stored elements are refused unread."""
     payload = _replace_pickle(_encode(torch.zeros(8)), _rebuild_pickle(5, (2, 1), 8, wrap=False))
-    _no_load(monkeypatch)
     with pytest.raises(ValueError, match="past its storage"):
         load_base64_tensor(payload, max_bytes=_LIMIT)
 
@@ -248,20 +347,11 @@ def _add_records(payload: str, names: list) -> str:
         (["archive/data/1"], "only the records"),
     ],
 )
-def test_extra_archive_records_rejected(monkeypatch, names: list, match: str) -> None:
+def test_extra_archive_records_rejected(names: list, match: str) -> None:
     """Records torch.save does not write, or too many of them, are refused unread."""
     payload = _add_records(_encode(torch.zeros(2)), names)
-    _no_load(monkeypatch)
     with pytest.raises(ValueError, match=match):
         load_base64_tensor(payload, max_bytes=8 << 20)
-
-
-def test_prefixed_archive_rejected(monkeypatch) -> None:
-    """Bytes before the first record make zipfile and torch.load read different records."""
-    payload = base64.b64encode(b"\0" * 64 + base64.b64decode(_encode(torch.zeros(2)))).decode()
-    _no_load(monkeypatch)
-    with pytest.raises(ValueError, match="start with its first record"):
-        load_base64_tensor(payload, max_bytes=_LIMIT)
 
 
 @pytest.mark.parametrize(
