@@ -3299,10 +3299,11 @@ class DecoderInputPreparer:
         torch.cat(src_rows, out=rows_host)
         dst_host = torch.empty((num_rows,), dtype=torch.long, pin_memory=pin)
         torch.cat(dst_rows, out=dst_host)
-        return (
-            dst_host.to("cuda", non_blocking=True),
-            rows_host.to("cuda", non_blocking=True),
-        )
+        dst_cuda = torch.empty_like(dst_host, device="cuda")
+        rows_cuda = torch.empty_like(rows_host, device="cuda")
+        device_copy.copy(CopySite.PROMPT_EMBEDS_DST_ROWS, dst_cuda, dst_host)
+        device_copy.copy(CopySite.PROMPT_EMBEDS_ROWS, rows_cuda, rows_host)
+        return dst_cuda, rows_cuda
 
     def _record_iter_states(self, host: HostInputs, scheduled_requests: ScheduledRequests) -> None:
         num_generation_tokens = (

@@ -7,7 +7,7 @@ The request contract is documented once, on ``TokensPrompt.prompt_embeds``.
 
 import hashlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -116,7 +116,7 @@ def _as_mask(mask: Union[Sequence[bool], torch.Tensor], length: int) -> torch.Te
 
 def build_prompt_embeds(
     prompt_token_ids: Optional[List[int]],
-    prompt_embeds: Any,
+    prompt_embeds: torch.Tensor,
     prompt_embeds_mask: Optional[Union[Sequence[bool], torch.Tensor]] = None,
     placeholder_token_id: int = 0,
 ) -> Tuple[List[int], PromptEmbeds]:
