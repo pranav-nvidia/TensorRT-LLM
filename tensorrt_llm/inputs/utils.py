@@ -241,10 +241,14 @@ def _check_tensor_pickle(pickled: bytes, max_bytes: int) -> _TensorSpec:
     for dim in size:
         logical_bytes *= dim
     if max(logical_bytes, storage_bytes) > max_bytes:
-        # A view (e.g. expand) can describe far more elements than it stores.
         raise ValueError(
             f"Tensor payload describes {max(logical_bytes, storage_bytes)} "
             f"bytes, over the {max_bytes}-byte limit.")
+    # A view repeating its storage (expand, overlapping strides) would let a
+    # small archive decode to a large tensor.
+    if logical_bytes > storage_bytes:
+        raise ValueError("Tensor payload view repeats storage elements; save a "
+                         "contiguous tensor.")
     if logical_bytes and offset + sum(
         (d - 1) * s for d, s in zip(size, stride)) >= pid[4]:
         raise ValueError("Tensor payload view reaches past its storage.")

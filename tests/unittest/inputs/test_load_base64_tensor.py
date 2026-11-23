@@ -164,10 +164,11 @@ def test_allocating_reducer_rejected() -> None:
         load_base64_tensor(payload, max_bytes=_LIMIT)
 
 
-def test_expanded_view_over_logical_limit() -> None:
-    """A view describing more elements than it stores is bounded by its logical size."""
-    view = torch.zeros(1, 1024).expand(4096, 1024)
-    with pytest.raises(ValueError, match="describes"):
+@pytest.mark.parametrize("view_size", [(2, 8), (4096, 1024)])
+def test_view_repeating_storage_rejected(view_size: tuple) -> None:
+    """A view describing more elements than it stores is refused at any size."""
+    view = torch.zeros(1, view_size[1]).expand(*view_size)
+    with pytest.raises(ValueError, match="repeats storage|describes"):
         load_base64_tensor(_encode(view), max_bytes=_LIMIT)
 
 
