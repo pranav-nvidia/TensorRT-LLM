@@ -1234,7 +1234,9 @@ class TestEmbedsParts:
             },
             mm_tracker,
         )
-        assert (await gridded["data"])["image_grid_thw"] == [1, 4, 4]
+        item = await gridded["data"]
+        assert torch.equal(item["embedding"], embedding)
+        assert item["image_grid_thw"] == [1, 4, 4]
 
     @pytest.mark.parametrize(
         ("part", "match"),
