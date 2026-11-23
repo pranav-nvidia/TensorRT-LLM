@@ -14,6 +14,7 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm.inputs import utils
 from tensorrt_llm.inputs.utils import async_load_base64_tensor, load_base64_tensor
 
 pytestmark = pytest.mark.cpu_only
@@ -72,6 +73,35 @@ def test_invalid_base64(payload: str) -> None:
     """Non-alphabet characters are rejected, with or without line breaks."""
     with pytest.raises(ValueError, match="not valid base64"):
         load_base64_tensor(payload, max_bytes=_LIMIT)
+
+
+def test_base64_decodes_without_strict_mode(monkeypatch) -> None:
+    """Python 3.10 has no a2b_base64 strict_mode; validated b64decode is used instead."""
+    calls = []
+    b64decode = base64.b64decode
+
+    def spy(text: str, validate: bool = False) -> bytes:
+        """Record the call and decode as ``base64.b64decode`` does."""
+        calls.append(validate)
+        return b64decode(text, validate=validate)
+
+    monkeypatch.setattr(utils.sys, "version_info", (3, 10, 0))
+    monkeypatch.setattr(utils.base64, "b64decode", spy)
+    tensor = torch.randn(4, 4)
+    assert torch.equal(load_base64_tensor(_encode(tensor), max_bytes=_LIMIT), tensor)
+    with pytest.raises(ValueError, match="not valid base64"):
+        load_base64_tensor("not base64!", max_bytes=_LIMIT)
+    assert calls and all(calls)
+
+
+def test_line_wrapped_base64_near_limit_accepted() -> None:
+    """Line breaks do not count toward the encoded-length limit."""
+    tensor = torch.randn(1000)
+    payload = _encode(tensor)
+    wrapped = "\r\n".join(payload[i : i + 76] for i in range(0, len(payload), 76))
+    limit = len(base64.b64decode(payload))
+    assert len(wrapped) > 4 * ((limit + 2) // 3)
+    assert torch.equal(load_base64_tensor(wrapped, max_bytes=limit), tensor)
 
 
 def test_line_wrapped_base64_accepted() -> None:
@@ -401,6 +431,17 @@ def test_storage_crc_mismatch_rejected() -> None:
     payload = _patch_storage_record(_encode(torch.zeros(4)), stored, 16, zlib.crc32(bytes(16)))
     with pytest.raises(ValueError, match="CRC"):
         load_base64_tensor(payload, max_bytes=_LIMIT)
+
+
+def test_zip64_record_away_from_locator_rejected() -> None:
+    """A locator pointing anywhere but right before itself could name a decoy record."""
+    raw = bytearray(base64.b64decode(_encode(torch.zeros(2))))
+    locator = len(raw) - 22 - 20
+    assert raw[locator : locator + 4] == b"PK\x06\x07"
+    (reloff,) = struct.unpack_from("<Q", raw, locator + 8)
+    struct.pack_into("<Q", raw, locator + 8, reloff - 8)
+    with pytest.raises(ValueError, match="directly precede its locator"):
+        load_base64_tensor(base64.b64encode(bytes(raw)).decode(), max_bytes=_LIMIT)
 
 
 def _add_records(payload: str, names: list) -> str:
