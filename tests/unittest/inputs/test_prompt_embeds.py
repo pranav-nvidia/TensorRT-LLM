@@ -184,6 +184,15 @@ def test_remap_through_placeholder_expansion() -> None:
         remap_prompt_embeds(pe, original, [1, 50, 70, 70, 70, 52, 2, 3], spans)
 
 
+def test_positions_stay_on_cpu_under_default_device() -> None:
+    original, expanded = [1, 50, 51, 52, 2, 3], [1, 50, 51, 51, 51, 52, 2, 3]
+    rows = _rows(2)
+    with torch.device("meta"):
+        _, pe = build_prompt_embeds(original, rows, [True, False, False, False, False, True])
+        moved = remap_prompt_embeds(pe, original, expanded, [(2, 5)])
+    assert pe.positions.device.type == moved.positions.device.type == "cpu"
+
+
 # Video notation: 50/52 = vision start/end, 53 = video placeholder rows,
 # 60/61 = timestamp text inserted before each frame.
 

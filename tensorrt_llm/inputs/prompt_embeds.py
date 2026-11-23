@@ -105,7 +105,7 @@ def _as_mask(mask: Union[Sequence[bool], torch.Tensor], length: int) -> torch.Te
         values = list(mask)
         if not all(isinstance(v, bool) for v in values):
             raise TypeError("prompt_embeds_mask must contain only bools")
-        mask_t = torch.tensor(values, dtype=torch.bool)
+        mask_t = torch.tensor(values, dtype=torch.bool, device="cpu")
     if mask_t.numel() != length:
         raise ValueError(
             f"prompt_embeds_mask length ({mask_t.numel()}) must equal the "
@@ -161,7 +161,7 @@ def build_prompt_embeds(
                 "prompt position is an embedding"
             )
         prompt_token_ids = [placeholder_token_id] * num_rows
-        positions = torch.arange(num_rows, dtype=torch.int64)
+        positions = torch.arange(num_rows, dtype=torch.int64, device="cpu")
     else:
         prompt_token_ids = list(prompt_token_ids)
         if prompt_embeds_mask is None:
@@ -171,7 +171,7 @@ def build_prompt_embeds(
                     f"{len(prompt_token_ids)} prompt tokens; pass "
                     "prompt_embeds_mask to place a subset of positions"
                 )
-            positions = torch.arange(num_rows, dtype=torch.int64)
+            positions = torch.arange(num_rows, dtype=torch.int64, device="cpu")
         else:
             mask_t = _as_mask(prompt_embeds_mask, len(prompt_token_ids))
             positions = torch.nonzero(mask_t, as_tuple=False).flatten().to(torch.int64)
@@ -277,7 +277,7 @@ def remap_prompt_embeds(
     rows = prompt_embeds.positions.tolist()
     if any(p in placeholders for p in rows):
         raise ValueError("prompt_embeds_mask selects a multimodal placeholder position.")
-    positions = torch.tensor([mapping[p] for p in rows], dtype=torch.int64)
+    positions = torch.tensor([mapping[p] for p in rows], dtype=torch.int64, device="cpu")
     embeds = prompt_embeds.embeds
     return PromptEmbeds(
         embeds=embeds,

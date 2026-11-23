@@ -3274,7 +3274,8 @@ class DecoderInputPreparer:
             if self._config.enable_attention_dp:
                 set_spec_metadata_all_rank_num_tokens(spec_metadata, *host.spec_all_rank_counts)
 
-        if host.lists.prompt_embeds_src_rows:
+        # Only the first pipeline stage applies the overlay.
+        if host.lists.prompt_embeds_src_rows and self.mapping.is_first_pp_rank():
             inputs["prompt_embeds_overlay"] = self._ship_prompt_embeds(host)
 
         if host.mm_token_indices is not None:
