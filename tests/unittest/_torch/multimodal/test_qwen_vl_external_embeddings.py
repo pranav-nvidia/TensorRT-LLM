@@ -72,7 +72,9 @@ def _make_processor(cls: type, deepstack_levels: int = 0, tokens_per_second=None
         video_token_id=_VIDEO_PAD,
         vision_start_token_id=_VISION_START,
         vision_end_token_id=_VISION_END,
-        text_config=SimpleNamespace(hidden_size=_HIDDEN, vocab_size=200000),
+        text_config=SimpleNamespace(
+            hidden_size=_HIDDEN, vocab_size=200000, max_position_embeddings=128000
+        ),
         vision_config=vision_config,
     )
     processor._processor = SimpleNamespace()
@@ -245,6 +247,34 @@ def test_qwen2_5_video_requires_one_time_scale(timing, match):
     processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
     with pytest.raises(ValueError, match=match):
         _attach(processor, "<|video_pad|>", {"video": [_video(2, 2, 2, **timing)]})
+
+
+def _attach_framed_video(processor, video: dict, max_tokens: int) -> tuple:
+    """Attach one framed video with a given generation length."""
+    return processor.attach_multimodal_embeddings(
+        {"prompt": "<|vision_start|><|video_pad|><|vision_end|>"},
+        {"video": [video]},
+        SamplingParams(max_tokens=max_tokens),
+    )
+
+
+@pytest.mark.parametrize(
+    "timing, match",
+    [({"second_per_grid_ts": 1e5}, "positions exceed"), ({"fps": 1e-300}, "overflows float32")],
+)
+def test_qwen2_5_video_positions_past_rotary_table_are_rejected(timing, match):
+    processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
+    with pytest.raises(ValueError, match=match):
+        _attach_framed_video(processor, _video(8, 2, 2, **timing), max_tokens=1)
+
+
+def test_qwen2_5_video_decode_positions_stay_in_rotary_table():
+    processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
+    # The last video position is 1 + 7 * 9141 * 2 = 127975, below 128000.
+    video = _video(8, 2, 2, second_per_grid_ts=9141.0)
+    _attach_framed_video(processor, video, max_tokens=1)
+    with pytest.raises(ValueError, match="decode positions reach"):
+        _attach_framed_video(processor, video, max_tokens=32)
 
 
 def test_qwen2_5_bare_video_placeholder_is_rejected():
