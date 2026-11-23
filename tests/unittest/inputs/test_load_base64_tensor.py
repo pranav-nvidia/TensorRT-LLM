@@ -360,7 +360,8 @@ def test_hand_built_pickle_accepted() -> None:
 
 def test_view_past_storage_rejected() -> None:
     """A size and stride reaching past the stored elements are refused unread."""
-    payload = _replace_pickle(_encode(torch.zeros(8)), _rebuild_pickle(5, (2, 1), 8, wrap=False))
+    # Four rows of two at stride 3 cover 8 elements but end at element 10.
+    payload = _replace_pickle(_encode(torch.zeros(8)), _rebuild_pickle(4, (3, 1), 8, wrap=False))
     with pytest.raises(ValueError, match="past its storage"):
         load_base64_tensor(payload, max_bytes=_LIMIT)
 
