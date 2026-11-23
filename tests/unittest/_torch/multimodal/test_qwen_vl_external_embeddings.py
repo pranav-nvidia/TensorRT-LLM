@@ -268,13 +268,28 @@ def test_qwen2_5_video_positions_past_rotary_table_are_rejected(timing, match):
         _attach_framed_video(processor, _video(8, 2, 2, **timing), max_tokens=1)
 
 
-def test_qwen2_5_video_decode_positions_stay_in_rotary_table():
+@pytest.mark.parametrize("max_tokens", [32, None])
+def test_qwen2_5_video_decode_positions_stay_in_rotary_table(max_tokens):
     processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
     # The last video position is 1 + 7 * 9141 * 2 = 127975, below 128000.
     video = _video(8, 2, 2, second_per_grid_ts=9141.0)
     _attach_framed_video(processor, video, max_tokens=1)
-    with pytest.raises(ValueError, match="decode positions reach"):
-        _attach_framed_video(processor, video, max_tokens=32)
+    with pytest.raises(ValueError, match="set max_tokens to at most 23$"):
+        _attach_framed_video(processor, video, max_tokens=max_tokens)
+
+
+def test_qwen2_5_decode_bound_clamps_max_tokens_to_context():
+    processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
+    # Positions trail the token count, so any max_tokens fits once clamped.
+    video = _video(2, 8, 8, second_per_grid_ts=1.0)
+    _attach_framed_video(processor, video, max_tokens=10**9)
+
+
+@pytest.mark.parametrize("timestamps", [[0.0, 1e308], [-1.0, 0.0]])
+def test_qwen3_out_of_range_timestamps_are_rejected(timestamps):
+    processor = _make_processor(Qwen3VLInputProcessorBase)
+    with pytest.raises(ValueError, match=r"\[0, 1e6\] seconds"):
+        _attach_framed_video(processor, _video(2, 4, 2, timestamps=timestamps), max_tokens=1)
 
 
 def test_qwen2_5_bare_video_placeholder_is_rejected():

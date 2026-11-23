@@ -1292,6 +1292,9 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         """Reject prompt or decode positions outside the rotary table.
 
         A video time scale moves positions independently of the token count.
+        Decoding is bounded the way the executor bounds it: max_tokens clamped
+        to the context left, taking max_seq_len at its ceiling of
+        max_position_embeddings (resolve_max_seq_len).
         """
         text_config = getattr(self.config, "text_config", self.config)
         max_positions = getattr(text_config, "max_position_embeddings", None)
@@ -1302,13 +1305,18 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             raise ValueError(
                 f"Qwen mRoPE positions exceed the model's {max_positions} "
                 "positions; check the video time scale")
-        if max_tokens is not None and position_deltas.numel():
-            last_position = (prompt_length + max_tokens - 1 +
-                             int(position_deltas.max()))
-            if last_position >= max_positions:
-                raise ValueError(
-                    f"Qwen mRoPE decode positions reach {last_position}, past "
-                    f"the model's {max_positions} positions")
+        decode_tokens = max_positions - prompt_length
+        if max_tokens is not None:
+            decode_tokens = min(decode_tokens, max_tokens)
+        if decode_tokens <= 0 or not position_deltas.numel():
+            return
+        delta = int(position_deltas.max())
+        last_position = prompt_length + decode_tokens - 1 + delta
+        if last_position >= max_positions:
+            raise ValueError(
+                f"Qwen mRoPE decode positions reach {last_position}, past the "
+                f"model's {max_positions} positions; set max_tokens to at most "
+                f"{max_positions - prompt_length - delta}")
 
     @staticmethod
     def _infer_image_grid_thw(num_tokens: int,
