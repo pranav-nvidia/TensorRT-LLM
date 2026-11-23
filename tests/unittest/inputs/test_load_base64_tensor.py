@@ -62,17 +62,24 @@ def test_encoded_length_checked_before_decode() -> None:
 
 
 def test_decoded_size_over_limit() -> None:
-    """A payload over the byte limit is rejected."""
-    payload = _encode(torch.zeros(64, 64))
-    with pytest.raises(ValueError, match="limit"):
-        load_base64_tensor(payload, max_bytes=4096)
+    """Decoded bytes over the limit are rejected even when the text length passes."""
+    with pytest.raises(ValueError, match="is 3 bytes, over the 2-byte limit"):
+        load_base64_tensor("AAAA", max_bytes=2)
 
 
-@pytest.mark.parametrize("payload", ["not base64!", "QUJD\nREVG"])
+@pytest.mark.parametrize("payload", ["not base64!", "QUJD\nRE!G"])
 def test_invalid_base64(payload: str) -> None:
-    """Non-alphabet characters and line breaks are rejected."""
+    """Non-alphabet characters are rejected, with or without line breaks."""
     with pytest.raises(ValueError, match="not valid base64"):
         load_base64_tensor(payload, max_bytes=_LIMIT)
+
+
+def test_line_wrapped_base64_accepted() -> None:
+    """MIME-style line-wrapped base64 decodes like the unwrapped text."""
+    tensor = torch.randn(16, 8)
+    payload = _encode(tensor)
+    wrapped = "\r\n".join(payload[i : i + 76] for i in range(0, len(payload), 76))
+    assert torch.equal(load_base64_tensor(wrapped, max_bytes=_LIMIT), tensor)
 
 
 def test_non_string_payload() -> None:
@@ -84,7 +91,7 @@ def test_non_string_payload() -> None:
 def test_legacy_format_rejected() -> None:
     """The pre-zip torch.save format declares storage sizes and is refused."""
     payload = _encode(torch.zeros(2, 2), _use_new_zipfile_serialization=False)
-    with pytest.raises(ValueError, match="zip archive"):
+    with pytest.raises(ValueError, match="zip"):
         load_base64_tensor(payload, max_bytes=_LIMIT)
 
 
@@ -235,12 +242,12 @@ def test_legacy_stream_before_zip_ignored() -> None:
     assert decoded.dtype == torch.float32 and torch.equal(decoded, torch.zeros(2, 2))
 
 
-def test_hidden_central_directory_ignored() -> None:
-    """A second central directory, reachable only through stored offsets, is never read.
+def test_hidden_central_directory_rejected() -> None:
+    """A second central directory, reachable only through stored offsets, is refused.
 
-    The EOCD overstates the central directory size, so zipfile reads the benign one
-    shifted back while miniz would read one hidden in the last entry's comment,
-    pointing at a deflated 16 MiB storage. The decoder reads only zipfile's view.
+    The EOCD overstates the central directory size and pads with a comment, so
+    zipfile reads the benign directory shifted back while miniz would read one
+    hidden in the last entry's comment, pointing at a deflated 16 MiB storage.
     """
     hidden_numel = 4 << 20
     pickled = _rebuild_pickle(hidden_numel // 2, (2, 1), hidden_numel, wrap=False)
@@ -271,8 +278,8 @@ def test_hidden_central_directory_ignored() -> None:
         "<IHHHHIIH", 0x06054B50, 0, 0, 3, 3, len(central), len(body) + shift, shift
     ) + bytes(shift)
     payload = base64.b64encode(bytes(body) + central + eocd).decode()
-    decoded = load_base64_tensor(payload, max_bytes=_LIMIT)
-    assert torch.equal(decoded, torch.zeros(2, 2))
+    with pytest.raises(ValueError, match="no comment"):
+        load_base64_tensor(payload, max_bytes=_LIMIT)
 
 
 def _rebuild_pickle(rows: int, stride: tuple, storage_numel: int, wrap: bool) -> bytes:
@@ -327,6 +334,75 @@ def test_view_past_storage_rejected() -> None:
         load_base64_tensor(payload, max_bytes=_LIMIT)
 
 
+def _view_pickle(offset: int, size: tuple, stride: tuple, storage_numel: int) -> bytes:
+    """A protocol-2 ``_rebuild_tensor_v2`` pickle of a float view with arbitrary ints."""
+
+    def num(value: int) -> bytes:
+        length = (value.bit_length() + 8) // 8
+        return b"\x8a" + bytes([length]) + value.to_bytes(length, "little", signed=True)
+
+    return (
+        b"\x80\x02ctorch._utils\n_rebuild_tensor_v2\n((X\x07\x00\x00\x00storage"
+        b"ctorch\nFloatStorage\nX\x01\x00\x00\x000X\x03\x00\x00\x00cpu"
+        + num(storage_numel)
+        + b"tQ"
+        + num(offset)
+        + b"("
+        + b"".join(num(v) for v in size)
+        + b"t("
+        + b"".join(num(v) for v in stride)
+        + b"t\x89ccollections\nOrderedDict\n)RtR."
+    )
+
+
+@pytest.mark.parametrize(
+    "offset, size, stride",
+    [
+        (0, (0, 2**64), (1, 1)),
+        (0, (1, 4), (2**64, 1)),
+        (2**64, (0,), (1,)),
+    ],
+)
+def test_out_of_range_view_values_rejected(offset: int, size: tuple, stride: tuple) -> None:
+    """Values the extent check skips (zero-sized or size-1 dims) are still bounded."""
+    payload = _replace_pickle(_encode(torch.zeros(4)), _view_pickle(offset, size, stride, 4))
+    with pytest.raises(ValueError, match="size, stride or offset"):
+        load_base64_tensor(payload, max_bytes=_LIMIT)
+
+
+def _patch_storage_record(payload: str, data: bytes, size: int, crc: int) -> str:
+    """Overwrite the data/0 record's bytes and its declared stored size and CRC."""
+    raw = bytearray(base64.b64decode(payload))
+    info = zipfile.ZipFile(io.BytesIO(bytes(raw))).getinfo("archive/data/0")
+    name_len, extra_len = struct.unpack_from("<HH", raw, info.header_offset + 26)
+    start = info.header_offset + 30 + name_len + extra_len
+    raw[start : start + len(data)] = data
+    struct.pack_into("<II", raw, info.header_offset + 14, crc, size)
+    entry = raw.find(b"PK\x01\x02")
+    while entry != -1:
+        name_len = struct.unpack_from("<H", raw, entry + 28)[0]
+        if raw[entry + 46 : entry + 46 + name_len] == b"archive/data/0":
+            struct.pack_into("<II", raw, entry + 16, crc, size)
+        entry = raw.find(b"PK\x01\x02", entry + 4)
+    return base64.b64encode(bytes(raw)).decode()
+
+
+def test_truncated_storage_record_rejected() -> None:
+    """A stored record shorter than its declared file size is refused."""
+    stored = struct.pack("<4f", 1, 2, 3, 4)
+    payload = _patch_storage_record(_encode(torch.zeros(4)), stored, 4, zlib.crc32(stored[:4]))
+    with pytest.raises(ValueError, match="truncated"):
+        load_base64_tensor(payload, max_bytes=_LIMIT)
+
+
+def test_storage_crc_mismatch_rejected() -> None:
+    """Storage bytes that do not match the record's CRC are refused."""
+    stored = struct.pack("<4f", 1, 2, 3, 4)
+    payload = _patch_storage_record(_encode(torch.zeros(4)), stored, 16, zlib.crc32(bytes(16)))
+    with pytest.raises(ValueError, match="CRC"):
+        load_base64_tensor(payload, max_bytes=_LIMIT)
+
+
 def _add_records(payload: str, names: list) -> str:
     """Append empty records to a torch.save archive."""
     src = zipfile.ZipFile(io.BytesIO(base64.b64decode(payload)))
@@ -342,7 +418,7 @@ def _add_records(payload: str, names: list) -> str:
 @pytest.mark.parametrize(
     "names, match",
     [
-        ([f"junk/{i}" for i in range(20_000)], "too many records"),
+        ([f"junk/{i}" for i in range(20_000)], "central directory is over"),
         (["archive/notes"], "only the records"),
         (["archive/data/1"], "only the records"),
     ],
@@ -357,10 +433,12 @@ def test_extra_archive_records_rejected(names: list, match: str) -> None:
 @pytest.mark.parametrize(
     "tensor",
     [
-        torch.zeros(4, 3)[::2],
-        torch.zeros(3, 2).t(),
-        torch.zeros(2, requires_grad=True),
-        torch.zeros(1000, 64, dtype=torch.bfloat16),
+        torch.arange(12.0).reshape(4, 3)[::2],
+        torch.arange(12.0).reshape(4, 3)[1:, 1:],
+        torch.arange(6.0).reshape(3, 2).t(),
+        torch.arange(10.0)[3:7],
+        torch.arange(4.0, requires_grad=True),
+        torch.randn(1000, 64).to(torch.bfloat16),
     ],
 )
 def test_ordinary_saved_tensors_accepted(tensor: torch.Tensor) -> None:
