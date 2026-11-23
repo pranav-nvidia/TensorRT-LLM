@@ -159,7 +159,7 @@ Another example uses ``curl``:
 Precomputed Prompt Embeddings
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-A server started with ``--enable_prompt_embeds`` accepts precomputed input embeddings in place of prompt tokens, on decoder models that support ``prompt_embeds`` in ``LLM.generate``. A payload is the base64 encoding of ``torch.save`` applied to one ``[num_tokens, hidden_size]`` float16, bfloat16 or float32 tensor whose rows equal the output of the model's input embedding module. The server loads payloads with ``weights_only=True``, accepts only uncompressed ``torch.save`` archives, and limits the decoded bytes of one request to ``TRTLLM_PROMPT_EMBEDS_MAX_BYTES`` (default 256 MiB). Enable the flag only for trusted clients.
+A server started with ``--enable_prompt_embeds`` accepts precomputed input embeddings in place of prompt tokens, on decoder models that support ``prompt_embeds`` in ``LLM.generate``. A payload is the base64 encoding of ``torch.save`` applied to one ``[num_tokens, hidden_size]`` float16, bfloat16 or float32 tensor whose rows equal the output of the model's input embedding module. The server never unpickles a payload: it accepts only an uncompressed, little-endian ``torch.save`` archive of one tensor, builds the tensor from its checked fields, and limits the decoded bytes of one request to ``TRTLLM_PROMPT_EMBEDS_MAX_BYTES`` (default 256 MiB). Enable the flag only for trusted clients.
 
 The Completions API takes ``prompt_embeds`` as one payload or a list of payloads. Each payload is a whole prompt, and these prompts are served before any ``prompt`` entries of the same request. ``echo`` and ``truncate_prompt_tokens`` are not supported with ``prompt_embeds``:
 

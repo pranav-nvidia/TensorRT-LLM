@@ -1656,8 +1656,8 @@ def launch_visual_gen_server(
     default=False,
     help="Accept precomputed input embeddings (prompt_embeds) on "
     "/v1/completions and as chat content parts. Payloads are torch.save "
-    "tensors loaded with weights_only=True; only enable this for trusted "
-    "clients.",
+    "files of one tensor, decoded without unpickling; only enable this for "
+    "trusted clients.",
     status="prototype")
 @stability_option(
     "--middleware",
