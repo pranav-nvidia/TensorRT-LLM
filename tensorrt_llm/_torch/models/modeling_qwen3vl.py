@@ -399,6 +399,9 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
                 f"{name}: expected {grid_t} timestamps (one per temporal patch), "
                 f"got {len(timestamps)}"
             )
+        # Timestamps are printed into the prompt; 1e6 s keeps each one short.
+        if any(not 0 <= timestamp <= 1e6 for timestamp in timestamps):
+            raise ValueError(f"{name}: timestamps must lie in [0, 1e6] seconds")
         return {"timestamps": timestamps}
 
     def _external_item_identity(
