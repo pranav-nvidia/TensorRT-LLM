@@ -444,6 +444,30 @@ def test_zip64_record_away_from_locator_rejected() -> None:
         load_base64_tensor(base64.b64encode(bytes(raw)).decode(), max_bytes=_LIMIT)
 
 
+def test_declared_storage_past_archive_rejected() -> None:
+    """A small archive declaring a large storage is refused before allocating it."""
+    numel = 1 << 20
+    payload = _replace_pickle(_encode(torch.zeros(4)), _view_pickle(0, (4,), (1,), numel))
+    raw = bytearray(base64.b64decode(payload))
+    info = zipfile.ZipFile(io.BytesIO(bytes(raw))).getinfo("archive/data/0")
+    struct.pack_into("<II", raw, info.header_offset + 18, numel * 4, numel * 4)
+    entry = raw.find(b"PK\x01\x02")
+    while entry != -1:
+        name_len = struct.unpack_from("<H", raw, entry + 28)[0]
+        if raw[entry + 46 : entry + 46 + name_len] == b"archive/data/0":
+            struct.pack_into("<II", raw, entry + 20, numel * 4, numel * 4)
+        entry = raw.find(b"PK\x01\x02", entry + 4)
+    with pytest.raises(ValueError, match="does not match its tensor"):
+        load_base64_tensor(base64.b64encode(bytes(raw)).decode(), max_bytes=8 * numel)
+
+
+def test_input_shorter_than_zip64_locator_rejected() -> None:
+    """Locator bytes are not read from before the start of a short input."""
+    eocd = struct.pack("<4sHHHHIIH", b"PK\x05\x06", 0, 0, 0, 0x4B50, 0x0706, 0, 0)
+    with pytest.raises(ValueError):
+        load_base64_tensor(base64.b64encode(bytes(8) + eocd).decode(), max_bytes=_LIMIT)
+
+
 def _add_records(payload: str, names: list) -> str:
     """Append empty records to a torch.save archive."""
     src = zipfile.ZipFile(io.BytesIO(base64.b64decode(payload)))

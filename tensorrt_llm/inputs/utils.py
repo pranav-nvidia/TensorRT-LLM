@@ -267,7 +267,7 @@ def _check_central_directory_size(content: bytes) -> None:
         raise ValueError("Tensor payload must end with a torch.save zip "
                          "directory record and no comment.")
     locator = len(content) - _ZIP_EOCD.size - _ZIP64_LOCATOR.size
-    if content[locator:locator + 4] == b"PK\x06\x07":
+    if locator >= 0 and content[locator:locator + 4] == b"PK\x06\x07":
         # zipfile reads the zip64 record where the locator points (newer
         # versions) or right before the locator (older ones); torch.save
         # writes it right before, so require both to be the same record.
@@ -325,9 +325,11 @@ def _read_tensor_archive(content: bytes,
             spec = _check_tensor_pickle(archive.read(prefix + "data.pkl"),
                                         max_bytes)
             storage_bytes = spec.storage_numel * spec.dtype.itemsize
-            if (data != [f"data/{spec.key}"]
-                    or archive.getinfo(prefix + data[0]).file_size
-                    != storage_bytes):
+            # The archive must hold the storage bytes before they are
+            # allocated; the declared sizes alone are the client's to choose.
+            if (data != [f"data/{spec.key}"] or
+                    archive.getinfo(prefix + data[0]).file_size != storage_bytes
+                    or storage_bytes > len(content)):
                 raise ValueError(
                     "Tensor payload storage record does not match its tensor.")
             if (prefix + "byteorder" in names
