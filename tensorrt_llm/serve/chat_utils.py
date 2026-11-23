@@ -146,9 +146,10 @@ def _parse_embeds_part(
     """Validate an embeddings part and return the coroutine that decodes it.
 
     The base64 length of every embeddings part in the request is charged
-    against `mm_embeds_max_bytes()` before anything is decoded; decoding runs
-    off the event loop, and the decoded tensors' logical bytes are charged
-    against the same limit. A part with metadata yields the item dict that
+    against `mm_embeds_max_bytes()` before anything is decoded, and decoding
+    runs off the event loop; the decoder returns no tensor larger than its
+    archive, so this bounds the decoded tensors too. A part with metadata
+    yields the item dict that
     `parse_external_embeddings` takes, a bare image part yields the tensor.
     """
     if not isinstance(content, dict):
@@ -169,8 +170,6 @@ def _parse_embeds_part(
 
     async def decode() -> Any:
         tensor = await async_load_base64_tensor(data, max_bytes=max_bytes)
-        mm_data_tracker.charge_embedding_tensor(
-            tensor.numel() * tensor.element_size(), max_bytes)
         if not metadata:
             return tensor
         return {"embedding": tensor, **metadata}

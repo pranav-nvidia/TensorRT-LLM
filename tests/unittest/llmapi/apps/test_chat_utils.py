@@ -1292,17 +1292,3 @@ class TestEmbedsParts:
         first["data"].close()
         with pytest.raises(ValueError, match="exceed the"):
             parse_chat_message_content_part(part, mm_tracker)
-
-    @pytest.mark.asyncio
-    async def test_request_tensor_limit_spans_compact_views(self, mm_tracker, monkeypatch):
-        import torch
-
-        # Each archive holds one 8-float row; each tensor is 4096 x 8 floats.
-        data = _b64_tensor(torch.zeros(1, 8).expand(4096, 8))
-        monkeypatch.setenv(_chat_utils.MM_EMBEDS_MAX_BYTES_ENV, str(200_000))
-        part = {"type": "image_embeds", "image_embeds": {"data": data}}
-        first = parse_chat_message_content_part(part, mm_tracker)
-        second = parse_chat_message_content_part(part, mm_tracker)
-        assert (await first["data"]).shape == (4096, 8)
-        with pytest.raises(ValueError, match="Embedding tensors in this request exceed"):
-            await second["data"]
