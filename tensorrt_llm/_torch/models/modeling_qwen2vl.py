@@ -1268,12 +1268,15 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             image_grid_thw: torch.LongTensor,
             video_grid_thw: torch.LongTensor,
             attention_mask: torch.Tensor,
-            second_per_grid_ts: torch.Tensor = None) -> Dict[str, torch.Tensor]:
+            second_per_grid_ts: torch.Tensor = None,
+            max_tokens: Optional[int] = None) -> Dict[str, torch.Tensor]:
         # Dispatch via ``type(self)`` so subclasses (e.g. Qwen3-VL) get their
         # overridden ``get_rope_index`` instead of the base implementation.
         mrope_position_ids, mrope_position_deltas = type(self).get_rope_index(
             self.config, input_ids, image_grid_thw, video_grid_thw,
             attention_mask, second_per_grid_ts)
+        self._check_mrope_positions(mrope_position_ids, mrope_position_deltas,
+                                    input_ids.shape[-1], max_tokens)
 
         mrope_config = {}
         mrope_config['mrope_position_ids'] = mrope_position_ids.to(
@@ -1281,6 +1284,31 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         mrope_config['mrope_position_deltas'] = mrope_position_deltas.to(
             'cpu').to(torch.int32).clone()
         return mrope_config
+
+    def _check_mrope_positions(self, position_ids: torch.Tensor,
+                               position_deltas: torch.Tensor,
+                               prompt_length: int,
+                               max_tokens: Optional[int]) -> None:
+        """Reject prompt or decode positions outside the rotary table.
+
+        A video time scale moves positions independently of the token count.
+        """
+        text_config = getattr(self.config, "text_config", self.config)
+        max_positions = getattr(text_config, "max_position_embeddings", None)
+        if type(max_positions) is not int:
+            return
+        if position_ids.numel() and (int(position_ids.min()) < 0 or int(
+                position_ids.max()) >= max_positions):
+            raise ValueError(
+                f"Qwen mRoPE positions exceed the model's {max_positions} "
+                "positions; check the video time scale")
+        if max_tokens is not None and position_deltas.numel():
+            last_position = (prompt_length + max_tokens - 1 +
+                             int(position_deltas.max()))
+            if last_position >= max_positions:
+                raise ValueError(
+                    f"Qwen mRoPE decode positions reach {last_position}, past "
+                    f"the model's {max_positions} positions")
 
     @staticmethod
     def _infer_image_grid_thw(num_tokens: int,
@@ -1335,6 +1363,11 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         else:
             temporal_patch_size = self.config.vision_config.temporal_patch_size
             second_per_grid_t = temporal_patch_size / item.fps
+        # MRoPE takes the time scale as float32.
+        if second_per_grid_t > torch.finfo(torch.float32).max:
+            raise ValueError(
+                f"video embedding of grid {item.grid_thw}: time scale "
+                f"{second_per_grid_t} seconds per grid overflows float32")
         return {"second_per_grid_t": second_per_grid_t}
 
     def _expand_external_video_placeholder(self, item: ExternalEmbeddingItem,
@@ -1506,7 +1539,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             self.get_mrope_config(mrope_input_ids, image_grid_thw,
                                   video_grid_thw,
                                   torch.ones_like(mrope_input_ids),
-                                  second_per_grid_ts),
+                                  second_per_grid_ts,
+                                  sampling_params.max_tokens),
         }
         return prompt_token_ids, {
             "multimodal_data": multimodal_data,
@@ -1580,7 +1614,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             processed_inputs.get('image_grid_thw', None),
             processed_inputs.get('video_grid_thw', None),
             processed_inputs.get('attention_mask', None),
-            processed_inputs.get('second_per_grid_ts', None))
+            processed_inputs.get('second_per_grid_ts', None),
+            sampling_params.max_tokens)
         multimodal_data["mrope_config"] = mrope_config
 
         fused_input_ids = processed_inputs['input_ids'][0]
