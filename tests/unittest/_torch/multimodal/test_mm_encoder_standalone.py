@@ -21,7 +21,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, suppress
 from pathlib import Path
-from typing import Generator
+from typing import Generator, Optional
 
 import numpy as np
 import pytest
@@ -1103,15 +1103,16 @@ def _raw_video_grids(llm: LLM, inputs: dict) -> tuple[torch.Tensor, object]:
     captured = {}
     get_mrope_config = processor.get_mrope_config
 
-    def capture(input_ids,
-                image_grid_thw,
-                video_grid_thw,
-                attention_mask,
-                second_per_grid_ts=None):
+    def capture(input_ids: torch.Tensor,
+                image_grid_thw: Optional[torch.Tensor],
+                video_grid_thw: Optional[torch.Tensor],
+                attention_mask: Optional[torch.Tensor],
+                second_per_grid_ts: Optional[torch.Tensor] = None,
+                max_tokens: Optional[int] = None) -> dict:
         captured.update(video_grid_thw=video_grid_thw,
                         second_per_grid_ts=second_per_grid_ts)
         return get_mrope_config(input_ids, image_grid_thw, video_grid_thw,
-                                attention_mask, second_per_grid_ts)
+                                attention_mask, second_per_grid_ts, max_tokens)
 
     processor.get_mrope_config = capture
     try:
