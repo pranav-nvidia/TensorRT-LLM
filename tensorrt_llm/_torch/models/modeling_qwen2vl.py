@@ -1429,7 +1429,10 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             raise NotImplementedError(
                 f"{type(self).__name__} does not support external multimodal embeddings"
             )
-        items_by_modality = parse_external_embeddings(multimodal_embedding)
+        items_by_modality = parse_external_embeddings(
+            multimodal_embedding,
+            temporal_patch_size=getattr(self.config.vision_config,
+                                        "temporal_patch_size", 1))
         text_prompt = inputs.get("prompt")
         if not text_prompt:
             raise ValueError("Text prompt is required but not provided")

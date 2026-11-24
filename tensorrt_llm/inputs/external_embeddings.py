@@ -122,7 +122,7 @@ def _check_embedding_tensor(embedding: Any, name: str) -> torch.Tensor:
 
 
 def _parse_item(
-    modality: str, index: int, embedding: Any, metadata: dict[str, Any]
+    modality: str, index: int, embedding: Any, metadata: dict[str, Any], temporal_patch_size: int
 ) -> ExternalEmbeddingItem:
     """Validate one item, as split_multimodal_embedding_items splits it."""
     name = f"{modality} embedding {index}"
@@ -150,6 +150,19 @@ def _parse_item(
         if any(dim <= 0 for dim in grid):
             raise ValueError(f"{name}: {grid_key} entries must be positive, got {grid}")
 
+    # Bound per-frame lists by the grid before copying them: one timestamp per
+    # temporal patch, at most temporal_patch_size sampled frames per patch.
+    for key, per_patch in (("timestamps", 1), ("frames_indices", temporal_patch_size)):
+        value = metadata.get(key)
+        if isinstance(value, (torch.Tensor, list, tuple)):
+            if grid is None:
+                raise ValueError(f"{name}: '{key}' requires '{grid_key}'")
+            length = value.numel() if isinstance(value, torch.Tensor) else len(value)
+            if length > grid[0] * per_patch:
+                raise ValueError(
+                    f"{name}: {key} has {length} entries for {grid[0]} temporal patches"
+                )
+
     def optional(key: str, convert: Callable[[Any, str], Any]) -> Any:
         return convert(metadata[key], key) if key in metadata else None
 
@@ -167,6 +180,7 @@ def _parse_item(
 def parse_external_embeddings(
     multimodal_embedding: Any,
     supported_modalities: Sequence[str] = EXTERNAL_EMBEDDING_MODALITIES,
+    temporal_patch_size: int = 1,
 ) -> dict[str, list[ExternalEmbeddingItem]]:
     """Normalize ``multi_modal_embeddings`` to per-modality item lists.
 
@@ -174,6 +188,7 @@ def parse_external_embeddings(
         multimodal_embedding: Mapping of modality to a tensor, a dict entry, or
             a list of them, in the order of that modality's prompt placeholders.
         supported_modalities: Modalities the caller accepts.
+        temporal_patch_size: Video frames per temporal patch, bounding ``frames_indices``.
 
     Returns:
         Modality to items, in the order given.
@@ -192,7 +207,7 @@ def parse_external_embeddings(
             raise TypeError(f"multi_modal_embeddings['{modality}'] must be a list")
         embeddings, metadata = split_multimodal_embedding_items(entries)
         items[modality] = [
-            _parse_item(modality, i, embedding, item_metadata)
+            _parse_item(modality, i, embedding, item_metadata, temporal_patch_size)
             for i, (embedding, item_metadata) in enumerate(zip(embeddings, metadata))
         ]
     if not any(items.values()):

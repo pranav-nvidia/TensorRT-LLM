@@ -366,6 +366,11 @@ def test_qwen2_5_bare_video_placeholder_is_rejected():
         ),
         ({"image": None}, "<|image_pad|>", "must be a list"),
         (
+            {"video": [_video(1, 2, 2, fps=1.0, frames_indices=list(range(10**6)))]},
+            "<|video_pad|>",
+            "frames_indices has 1000000 entries for 1 temporal patches",
+        ),
+        (
             {"video": [_video(1, 2, 2, timestamps=[0.0], fps=None)]},
             "<|video_pad|>",
             r"omit \['fps'\] instead of passing None",
