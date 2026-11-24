@@ -231,6 +231,12 @@ def test_remap_text_merged_with_framing() -> None:
     repeated = [1, 62, 2, 50, 53, 53, 52, 3]
     with pytest.raises(ValueError, match="ambiguous"):
         remap_prompt_embeds(merged, original, repeated, [(4, 6)])
+    # "</task>" before a video: ">" (2) merges into "><" (62) and the timestamp ends in ">".
+    original = [1, 7, 2, 50, 53, 52, 3]
+    closing = [1, 7, 62, 63, 2, 50, 53, 53, 52, 3]
+    _, tag = build_prompt_embeds(original, _rows(1), [False, False, True] + [False] * 4)
+    with pytest.raises(ValueError, match="ambiguous"):
+        remap_prompt_embeds(tag, original, closing, [(6, 8)])
 
 
 def test_remap_text_after_video_matching_timestamp() -> None:
