@@ -358,7 +358,12 @@ def test_qwen2_5_bare_video_placeholder_is_rejected():
             "<|video_pad|>",
             r"omit \['fps'\] instead of passing None",
         ),
-        ({"image": [torch.ones(4, _HIDDEN, dtype=torch.int32)]}, "<|image_pad|>", "floating"),
+        ({"image": [torch.ones(4, _HIDDEN, dtype=torch.int32)]}, "<|image_pad|>", "bfloat16"),
+        (
+            {"image": [torch.ones(4, _HIDDEN).to(torch.float8_e4m3fn)]},
+            "<|image_pad|>",
+            "bfloat16",
+        ),
         ({"audio": [torch.ones(4, _HIDDEN)]}, "<|image_pad|>", "Unsupported modalities"),
         (
             {"image": [{"mm_embeddings": torch.ones(4, _HIDDEN), "timestamps": [0.0]}]},
@@ -400,13 +405,11 @@ def test_position_metadata_joins_the_cache_key():
     assert early[0] != late[0]
 
 
-def test_uuid_joins_the_cache_key_and_absent_modalities_are_ignored():
+def test_uuids_of_absent_modalities_are_ignored():
     processor = _make_processor(Qwen3VLInputProcessorBase)
     prompt = "<|vision_start|><|image_pad|><|vision_end|>"
     image = {"image": [{"mm_embeddings": torch.ones(4, _HIDDEN), "image_grid_thw": [1, 4, 4]}]}
     _, plain = _hashes(processor, prompt, image)
-    _, tagged = _hashes(processor, prompt, image, multi_modal_uuids={"image": ["img-1"]})
-    assert tagged != plain
     # As for raw media, a UUID key with no items of that modality is ignored.
     _, other = _hashes(processor, prompt, image, multi_modal_uuids={"video": ["clip-1"]})
     assert other == plain

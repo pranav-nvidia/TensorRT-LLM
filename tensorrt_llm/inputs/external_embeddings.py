@@ -15,7 +15,11 @@ from typing import Any, Callable, Optional, Sequence
 
 import torch
 
+from .multimodal import split_multimodal_embedding_items
+
 EXTERNAL_EMBEDDING_MODALITIES = ("image", "video")
+
+_EMBEDDING_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
 
 _ITEM_KEYS = frozenset(
     {
@@ -104,8 +108,12 @@ def _check_embedding_tensor(embedding: Any, name: str) -> torch.Tensor:
         raise TypeError(f"{name} must be a torch.Tensor, got {type(embedding).__name__}")
     if embedding.layout != torch.strided:
         raise ValueError(f"{name} must be a dense tensor, got layout {embedding.layout}")
-    if not embedding.dtype.is_floating_point:
-        raise ValueError(f"{name} must be a floating-point tensor, got {embedding.dtype}")
+    # Batching concatenates items before casting to the model dtype, and
+    # float8 does not promote with other dtypes.
+    if embedding.dtype not in _EMBEDDING_DTYPES:
+        raise ValueError(
+            f"{name} must be a float16, bfloat16, float32 or float64 tensor, got {embedding.dtype}"
+        )
     if embedding.dim() != 2:
         raise ValueError(f"{name} must be rank 2, got shape {tuple(embedding.shape)}")
     if embedding.shape[0] <= 0 or embedding.shape[1] <= 0:
@@ -113,45 +121,41 @@ def _check_embedding_tensor(embedding: Any, name: str) -> torch.Tensor:
     return embedding
 
 
-def _parse_item(modality: str, index: int, entry: Any) -> ExternalEmbeddingItem:
-    """Normalize one user entry to an ExternalEmbeddingItem."""
+def _parse_item(
+    modality: str, index: int, embedding: Any, metadata: dict[str, Any]
+) -> ExternalEmbeddingItem:
+    """Validate one item, as split_multimodal_embedding_items splits it."""
     name = f"{modality} embedding {index}"
-    if isinstance(entry, torch.Tensor):
-        return ExternalEmbeddingItem(modality, _check_embedding_tensor(entry, name))
-    if not isinstance(entry, dict):
-        raise TypeError(f"{name} must be a tensor or a dict, got {type(entry).__name__}")
-    unknown = set(entry) - _ITEM_KEYS
+    unknown = set(metadata) - _ITEM_KEYS
     if unknown:
         raise ValueError(f"{name} has unknown keys {sorted(unknown)}")
-    if "mm_embeddings" not in entry:
-        raise ValueError(f"{name} is missing 'mm_embeddings'")
     # The cache key hashes the metadata as passed, and None has no hash.
-    absent = sorted(key for key, value in entry.items() if value is None)
+    absent = sorted(key for key, value in metadata.items() if value is None)
     if absent:
         raise ValueError(f"{name}: omit {absent} instead of passing None")
     grid_key = f"{modality}_grid_thw"
     other_grid_key = "video_grid_thw" if modality == "image" else "image_grid_thw"
-    if other_grid_key in entry:
+    if other_grid_key in metadata:
         raise ValueError(f"{name} must use '{grid_key}', not '{other_grid_key}'")
     if modality == "image":
         for key in ("timestamps", "fps", "frames_indices", "second_per_grid_ts"):
-            if key in entry:
+            if key in metadata:
                 raise ValueError(f"{name}: '{key}' only applies to video")
 
     grid = None
-    if grid_key in entry:
-        grid = _as_int_tuple(entry[grid_key], grid_key)
+    if grid_key in metadata:
+        grid = _as_int_tuple(metadata[grid_key], grid_key)
         if len(grid) != 3:
             raise ValueError(f"{name}: {grid_key} must have 3 entries (t, h, w), got {grid}")
         if any(dim <= 0 for dim in grid):
             raise ValueError(f"{name}: {grid_key} entries must be positive, got {grid}")
 
     def optional(key: str, convert: Callable[[Any, str], Any]) -> Any:
-        return convert(entry[key], key) if key in entry else None
+        return convert(metadata[key], key) if key in metadata else None
 
     return ExternalEmbeddingItem(
         modality,
-        _check_embedding_tensor(entry["mm_embeddings"], name),
+        _check_embedding_tensor(embedding, name),
         grid_thw=grid,
         timestamps=optional("timestamps", _as_float_tuple),
         fps=optional("fps", _as_positive_float),
@@ -184,11 +188,13 @@ def parse_external_embeddings(
         )
     items: dict[str, list[ExternalEmbeddingItem]] = {}
     for modality, entries in multimodal_embedding.items():
-        if isinstance(entries, (torch.Tensor, dict)):
-            entries = [entries]
-        if not isinstance(entries, (list, tuple)):
+        if not isinstance(entries, (torch.Tensor, dict, list, tuple)):
             raise TypeError(f"multi_modal_embeddings['{modality}'] must be a list")
-        items[modality] = [_parse_item(modality, i, entry) for i, entry in enumerate(entries)]
+        embeddings, metadata = split_multimodal_embedding_items(entries)
+        items[modality] = [
+            _parse_item(modality, i, embedding, item_metadata)
+            for i, (embedding, item_metadata) in enumerate(zip(embeddings, metadata))
+        ]
     if not any(items.values()):
         raise ValueError("At least one multimodal embedding is required")
     return items
