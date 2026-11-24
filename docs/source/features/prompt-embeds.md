@@ -30,11 +30,15 @@ out = llm.generate(
 
 On Qwen2-VL, Qwen2.5-VL and Qwen3-VL the same keys combine with `multi_modal_data`. The mask then indexes the ids before the image or video placeholder expands, and must not select a placeholder.
 
+## Supported models
+
+A model accepts prompt embeddings when its class sets `supports_prompt_embeds = True`; the request is rejected on any other model, and the error names the reason. Opted-in models include the Llama, Mistral and Mixtral, Qwen2 to Qwen3.5 (dense, MoE and VL), Gemma3 and Gemma4, DeepSeek-V3, GLM, GPT-OSS, Nemotron and Phi-3 families. `modeling_v2` implementations do not accept them yet.
+
 ## Behaviour
 
 - Rows must equal what the model's input embedding layer would produce, including any scaling it applies. They are copied when the request is submitted.
 - Placeholder ids still feed repetition penalties and prompt logprobs. A prompt given only as embeddings schedules id 0 at every position.
-- KV cache blocks are reused only across identical ids and rows. With the V2 KV cache manager and no KV connector, blocks before the first row are shared with plain-token prompts; otherwise the whole request is scoped by a salt derived from the rows.
+- KV cache blocks are reused only across identical ids and rows. With the V2 KV cache manager and no KV connector, blocks before the first row are shared with plain-token prompts; otherwise the whole request is scoped by a salt derived from the rows. KV cache events from the V2 manager report embedding positions as hexadecimal row keys in `token_ids`.
 - Gemma4 per-layer embeddings read the token id after the embedding layer; at embedding positions they see the pad id, so the output can depend on that choice.
 
 ## Limitations
