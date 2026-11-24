@@ -1296,3 +1296,55 @@ class TestEmbedsParts:
         first["data"].close()
         with pytest.raises(ValueError, match="exceed the"):
             parse_chat_message_content_part(part, mm_tracker)
+
+    @pytest.mark.parametrize("same_message", [True, False])
+    def test_request_byte_limit_closes_parked_decoders(self, monkeypatch, same_message):
+        import gc
+        import warnings
+
+        import torch
+
+        data = _b64_tensor(torch.zeros(16, 16))
+        monkeypatch.setenv(_chat_utils.MM_EMBEDS_MAX_BYTES_ENV, str(len(data)))
+        decoder = AsyncMock()
+        monkeypatch.setattr(_chat_utils, "async_load_base64_tensor", decoder)
+        part = {"type": "image_embeds", "image_embeds": {"data": data}}
+        if same_message:
+            messages = [{"role": "user", "content": [part, part]}]
+        else:
+            messages = [{"role": "user", "content": [part]}] * 2
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with pytest.raises(ValueError, match="exceed the"):
+                parse_chat_messages_coroutines(
+                    messages, MagicMock(), None, model_type_override="qwen2_vl"
+                )
+            gc.collect()
+        decoder.assert_not_called()
+        assert not [w for w in caught if "never awaited" in str(w.message)]
+
+    @pytest.mark.asyncio
+    async def test_failed_load_cancels_loads_still_running(self):
+        import asyncio
+
+        started, cancelled = asyncio.Event(), asyncio.Event()
+
+        async def slow_load():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        async def failing_load():
+            await started.wait()
+            raise ValueError("bad payload")
+
+        tracker = MultimodalDataTracker(model_type="qwen2_vl")
+        tracker.add_data("image", slow_load())
+        tracker.add_data("image", failing_load(), is_embedding=True)
+        with pytest.raises(ValueError, match="bad payload"):
+            await tracker.retrieve_all_async()
+        assert cancelled.is_set()
+        assert asyncio.all_tasks() == {asyncio.current_task()}

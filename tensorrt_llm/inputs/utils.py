@@ -11,8 +11,8 @@ import zipfile
 from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
-from typing import (Any, Collection, Coroutine, Dict, List, NamedTuple,
-                    Optional, Tuple, TypedDict, Union)
+from typing import (Any, Collection, Coroutine, Dict, Iterable, List,
+                    NamedTuple, Optional, Tuple, TypedDict, Union)
 from urllib.parse import urlparse
 
 import numpy as np
@@ -712,6 +712,25 @@ class ConversationMessage(TypedDict, total=False):
     tools: List[Dict[str, Any]]
 
 
+async def _gather_or_cancel(*aws: Any) -> List[Any]:
+    """`asyncio.gather` that cancels the others when one fails, then raises."""
+    tasks = [asyncio.ensure_future(aw) for aw in aws]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
+def close_pending_loads(items: Iterable[Any]) -> None:
+    """Close the never-started load coroutines among `items`."""
+    for item in items:
+        if asyncio.iscoroutine(item):
+            item.close()
+
+
 class MultimodalDataTracker:
     """Tracks and manages multimodal data for both sync and async processing."""
 
@@ -753,8 +772,9 @@ class MultimodalDataTracker:
         """Retrieve all collected multimodal data and embeddings.
 
         All coroutines across all modalities (and across _data/_embeddings) are
-        gathered concurrently in a single asyncio.gather call, so e.g. image
-        downloads and video downloads overlap instead of running sequentially.
+        gathered concurrently, so e.g. image downloads and video downloads
+        overlap instead of running sequentially. The first failure cancels the
+        loads still running and is raised once they have stopped.
         """
 
         async def _retrieve(
@@ -767,7 +787,7 @@ class MultimodalDataTracker:
             if not pairs:
                 return None
             modality_keys, coroutines = zip(*pairs)
-            results = await asyncio.gather(*coroutines)
+            results = await _gather_or_cancel(*coroutines)
             out: dict[str, list] = defaultdict(list)
             for modality, result in zip(modality_keys, results):
                 out[modality].append(result)
@@ -777,7 +797,7 @@ class MultimodalDataTracker:
             return None, None
         # _data and _embeddings also gathered concurrently
         with _time_input_processing("media_load"):
-            data_result, embed_result = await asyncio.gather(
+            data_result, embed_result = await _gather_or_cancel(
                 _retrieve(self._data), _retrieve(self._embeddings))
         return data_result, embed_result
 
@@ -794,13 +814,15 @@ class MultimodalDataTracker:
         Placeholder counts and `item_order` are unaffected; `add_data` builds
         both synchronously.
         """
+        self.close_pending()
+        return None, None
+
+    def close_pending(self) -> None:
+        """Close the parked loads without running them; see `discard_all_async`."""
         for pending in (self._data, self._embeddings):
             for items in pending.values():
-                for item in items:
-                    if asyncio.iscoroutine(item):
-                        item.close()
+                close_pending_loads(items)
             pending.clear()
-        return None, None
 
     def retrieve_all_sync(
         self
