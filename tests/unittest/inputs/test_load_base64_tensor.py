@@ -443,6 +443,23 @@ def test_padding_before_the_end_rejected(monkeypatch) -> None:
         load_base64_tensor(payload, max_bytes=_LIMIT)
 
 
+@pytest.mark.parametrize("tail", ["", "\n", "\r\n" * 40])
+def test_sliced_decoding_matches_whole_text(monkeypatch, tail: str) -> None:
+    """Sliced decoding agrees with whole-text decoding, padding at a slice end included."""
+    monkeypatch.setattr(utils, "_BASE64_SLICE_CHARS", 64)
+    for size in range(40, 52):
+        raw = bytes(range(size))
+        text = base64.b64encode(raw).decode()
+        wrapped = "\n".join(text[i : i + 16] for i in range(0, len(text), 16))
+        assert utils._b64decode_strict(text + tail, strip_whitespace=True) == raw
+        assert utils._b64decode_strict(wrapped + tail, strip_whitespace=True) == raw
+        if not tail:
+            assert utils._b64decode_strict(text) == raw
+        if text.endswith("="):
+            with pytest.raises(ValueError):
+                utils._b64decode_strict(text + tail + "QQ==", strip_whitespace=True)
+
+
 def _patch_storage_record(payload: str, data: bytes, size: int, crc: int) -> str:
     """Overwrite the data/0 record's bytes and its declared stored size and CRC."""
     raw = bytearray(base64.b64decode(payload))
