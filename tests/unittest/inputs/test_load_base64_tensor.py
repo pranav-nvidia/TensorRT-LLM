@@ -478,6 +478,62 @@ def test_oversized_pickle_record_rejected_unread(monkeypatch) -> None:
     assert not any(name.endswith("data.pkl") for name in reads)
 
 
+def _patch_record_sizes(payload: str, record: str, compress_size: int, file_size: int) -> str:
+    """Overwrite one record's declared stored and uncompressed sizes in both its headers."""
+    raw = bytearray(base64.b64decode(payload))
+    name = f"archive/{record}".encode()
+    info = zipfile.ZipFile(io.BytesIO(bytes(raw))).getinfo(name.decode())
+    struct.pack_into("<II", raw, info.header_offset + 18, compress_size, file_size)
+    entry = raw.find(b"PK\x01\x02")
+    while entry != -1:
+        name_len = struct.unpack_from("<H", raw, entry + 28)[0]
+        if raw[entry + 46 : entry + 46 + name_len] == name:
+            struct.pack_into("<II", raw, entry + 20, compress_size, file_size)
+        entry = raw.find(b"PK\x01\x02", entry + 4)
+    return base64.b64encode(bytes(raw)).decode()
+
+
+def _spy_reads(monkeypatch) -> list:
+    """Record the names of archive records the loader reads."""
+    read = zipfile.ZipFile.read
+    reads = []
+
+    def spy(self: zipfile.ZipFile, name: str, *args: object) -> bytes:
+        reads.append(name)
+        return read(self, name, *args)
+
+    monkeypatch.setattr(zipfile.ZipFile, "read", spy)
+    return reads
+
+
+@pytest.mark.parametrize("record", ["data.pkl", "byteorder"])
+def test_record_sizes_must_agree(monkeypatch, record: str) -> None:
+    """A stored record whose two declared sizes differ is refused before any record is read."""
+    payload = _encode(torch.zeros(4096))
+    info = zipfile.ZipFile(io.BytesIO(base64.b64decode(payload))).getinfo(f"archive/{record}")
+    # zipfile would read compress_size bytes, past the small declared file_size.
+    forged = _patch_record_sizes(payload, record, info.file_size + 4096, info.file_size)
+    reads = _spy_reads(monkeypatch)
+    with pytest.raises(ValueError, match="uncompressed"):
+        load_base64_tensor(forged, max_bytes=_LIMIT)
+    assert reads == []
+
+
+@pytest.mark.parametrize("value", [b"little\n", b"bigend"])
+def test_byteorder_record_must_be_little(monkeypatch, value: bytes) -> None:
+    """A longer byteorder record is refused unread; a six-byte one must say little."""
+    src = zipfile.ZipFile(io.BytesIO(base64.b64decode(_encode(torch.zeros(4)))))
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_STORED) as dst:
+        for info in src.infolist():
+            data = value if info.filename.endswith("/byteorder") else src.read(info)
+            dst.writestr(info.filename, data)
+    reads = _spy_reads(monkeypatch)
+    with pytest.raises(ValueError, match="little-endian"):
+        load_base64_tensor(base64.b64encode(out.getvalue()).decode(), max_bytes=_LIMIT)
+    assert any(name.endswith("byteorder") for name in reads) == (len(value) == 6)
+
+
 def test_empty_tensor_loads_on_cpu() -> None:
     """A tensor with no storage loads on CPU even when the default device is elsewhere."""
     payload = _encode(torch.zeros(0, 4))
@@ -504,10 +560,10 @@ def _patch_storage_record(payload: str, data: bytes, size: int, crc: int) -> str
 
 
 def test_truncated_storage_record_rejected() -> None:
-    """A stored record shorter than its declared file size is refused."""
+    """A stored record shorter than its declared file size is refused from its sizes."""
     stored = struct.pack("<4f", 1, 2, 3, 4)
     payload = _patch_storage_record(_encode(torch.zeros(4)), stored, 4, zlib.crc32(stored[:4]))
-    with pytest.raises(ValueError, match="truncated"):
+    with pytest.raises(ValueError, match="uncompressed"):
         load_base64_tensor(payload, max_bytes=_LIMIT)
 
 

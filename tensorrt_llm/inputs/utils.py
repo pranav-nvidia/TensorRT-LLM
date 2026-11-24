@@ -329,7 +329,10 @@ def _read_tensor_archive(content: bytes,
                     "torch.save writes for one tensor.")
             total = 0
             for member in members:
-                if member.compress_type != zipfile.ZIP_STORED:
+                # zipfile reads compress_size bytes even for a stored member,
+                # so the two sizes must agree for file_size to bound reads.
+                if (member.compress_type != zipfile.ZIP_STORED
+                        or member.compress_size != member.file_size):
                     raise ValueError(
                         "Tensor payload members must be uncompressed.")
                 total += member.file_size
