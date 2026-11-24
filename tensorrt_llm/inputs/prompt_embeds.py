@@ -206,6 +206,27 @@ def build_prompt_embeds(
     return prompt_token_ids, snapshot
 
 
+@dataclass(frozen=True)
+class PrebuiltPromptEmbeds(PromptEmbeds):
+    """A snapshot handed to ``LLM.generate_async`` by the code that built it.
+
+    For trtllm-serve, which builds it off its event loop: ``generate_async``
+    takes it without copying or hashing the rows again, so the builder must
+    not keep or change them. Callers of the LLM API pass a tensor instead.
+    """
+
+
+def prebuild_prompt_embeds(
+    prompt_token_ids: list[int] | None,
+    prompt_embeds: torch.Tensor,
+    prompt_embeds_mask: Sequence[bool] | torch.Tensor | None = None,
+) -> tuple[list[int], PrebuiltPromptEmbeds]:
+    """Run ``build_prompt_embeds`` for a snapshot to hand to ``LLM.generate_async``."""
+    token_ids, snapshot = build_prompt_embeds(prompt_token_ids, prompt_embeds, prompt_embeds_mask)
+    fields = {f.name: getattr(snapshot, f.name) for f in dataclasses.fields(snapshot)}
+    return token_ids, PrebuiltPromptEmbeds(**fields)
+
+
 def prompt_embeds_cache_salt(user_salt: str | None, digest: str) -> str:
     """Return the cache salt that scopes reuse to identical embeddings.
 

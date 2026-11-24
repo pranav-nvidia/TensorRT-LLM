@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU tests for prompt-embedding validation, identity and chunk placement."""
 
+import dataclasses
 from types import SimpleNamespace
+from typing import Any, Dict
 
 import pytest
 import torch
@@ -14,6 +16,7 @@ from tensorrt_llm.inputs.prompt_embeds import (
     build_prompt_embeds,
     multimodal_item_spans,
     multimodal_run_spans,
+    prebuild_prompt_embeds,
     prompt_embeds_block_key,
     prompt_embeds_cache_salt,
     remap_prompt_embeds,
@@ -299,3 +302,50 @@ def test_remap_keeps_already_expanded_ids() -> None:
     _, on_frame = build_prompt_embeds(video, _rows(1), [p == 8 for p in range(len(video))])
     with pytest.raises(ValueError, match="multimodal placeholder"):
         remap_prompt_embeds(on_frame, video, list(video), *spans)
+
+
+def _split_prompt_embeds(inputs: Dict[str, Any]) -> Any:
+    """Call ``BaseLLM._split_prompt_embeds`` on a minimal decoder-only stand-in."""
+    from tensorrt_llm.llmapi.llm import BaseLLM
+
+    llm = SimpleNamespace(
+        _PROMPT_EMBEDS_MULTIMODAL_KEYS=BaseLLM._PROMPT_EMBEDS_MULTIMODAL_KEYS,
+        _PROMPT_EMBEDS_ALLOWED_KEYS=BaseLLM._PROMPT_EMBEDS_ALLOWED_KEYS,
+        _normalize_token_ids=BaseLLM._normalize_token_ids,
+        _is_encoder_decoder_model=lambda: False,
+        args=SimpleNamespace(backend="pytorch", mm_encoder_only=False),
+        _encode_only=False,
+    )
+    return BaseLLM._split_prompt_embeds(llm, inputs)
+
+
+def test_llm_takes_prebuilt_snapshot() -> None:
+    """The LLM API takes a prebuilt snapshot as is and refuses one that does not fit its prompt."""
+    ids, snapshot = prebuild_prompt_embeds(
+        [5, 0, 0, 6], torch.ones(2, 4), [False, True, True, False]
+    )
+    prompt, taken = _split_prompt_embeds({"prompt_token_ids": ids, "prompt_embeds": snapshot})
+    assert taken is snapshot and prompt["prompt_token_ids"] == ids
+    # A snapshot built for a caller to keep is not trusted: only tensors are.
+    _, kept = build_prompt_embeds(ids, torch.ones(2, 4), [False, True, True, False])
+    with pytest.raises(TypeError, match="must be a torch.Tensor"):
+        _split_prompt_embeds({"prompt_token_ids": ids, "prompt_embeds": kept})
+    bad = [
+        {"prompt_token_ids": ids[:2], "prompt_embeds": snapshot},
+        {"prompt_token_ids": ids, "prompt_embeds": snapshot.identity_only()},
+        {
+            "prompt_token_ids": ids,
+            "prompt_embeds": dataclasses.replace(snapshot, positions=torch.tensor([2, 1])),
+        },
+        {
+            "prompt_token_ids": ids,
+            "prompt_embeds": dataclasses.replace(snapshot, positions=torch.tensor([-1, 1])),
+        },
+        {
+            "prompt_token_ids": ids,
+            "prompt_embeds": dataclasses.replace(snapshot, embeds=torch.ones(3, 4)),
+        },
+    ]
+    for inputs in bad:
+        with pytest.raises(ValueError, match="PrebuiltPromptEmbeds needs"):
+            _split_prompt_embeds(inputs)

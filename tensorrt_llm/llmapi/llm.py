@@ -57,9 +57,9 @@ from ..executor.utils import (RequestError, create_mpi_comm_session,
 from ..inputs import (GenerationInputs, PromptInputs, TokensPrompt,
                       create_input_processor, create_input_processor_with_hash,
                       maybe_compute_mm_embed_cumsum, prompt_inputs)
-from ..inputs.prompt_embeds import (PromptEmbeds, build_prompt_embeds,
-                                    multimodal_item_spans, multimodal_run_spans,
-                                    remap_prompt_embeds)
+from ..inputs.prompt_embeds import (PrebuiltPromptEmbeds, PromptEmbeds,
+                                    build_prompt_embeds, multimodal_item_spans,
+                                    multimodal_run_spans, remap_prompt_embeds)
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
@@ -1039,6 +1039,23 @@ class BaseLLM:
         if prompt_token_ids is not None:
             prompt_token_ids = self._normalize_token_ids(
                 prompt_token_ids, "prompt_token_ids")
+        if isinstance(inputs["prompt_embeds"], PrebuiltPromptEmbeds):
+            # trtllm-serve built it off its event loop and keeps no reference;
+            # hashing it again would block there. Only its shape is checked.
+            snapshot = inputs["prompt_embeds"]
+            positions = snapshot.positions
+            if (prompt_token_ids is None or snapshot.embeds is None
+                    or inputs.get("prompt_embeds_mask") is not None
+                    or positions.dim() != 1 or positions.numel() == 0
+                    or tuple(snapshot.embeds.shape) != (positions.numel(),
+                                                        snapshot.hidden_size)
+                    or int(positions[0]) < 0
+                    or int(positions[-1]) >= len(prompt_token_ids) or bool(
+                        (positions[1:] <= positions[:-1]).any())):
+                raise ValueError(
+                    "A PrebuiltPromptEmbeds needs the prompt_token_ids it "
+                    "was built for and no prompt_embeds_mask.")
+            return TokensPrompt(prompt_token_ids=prompt_token_ids), snapshot
         prompt_token_ids, prompt_embeds = build_prompt_embeds(
             prompt_token_ids, inputs["prompt_embeds"],
             inputs.get("prompt_embeds_mask"))
