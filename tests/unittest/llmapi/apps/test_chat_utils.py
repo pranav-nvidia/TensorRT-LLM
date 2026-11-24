@@ -1348,6 +1348,6 @@ class TestEmbedsParts:
         tracker.add_data("image", slow_load())
         tracker.add_data("image", failing_load(), is_embedding=True)
         with pytest.raises(ValueError, match="bad payload"):
-            await tracker.retrieve_all_async()
+            await asyncio.wait_for(tracker.retrieve_all_async(), timeout=30)
         assert cancelled.is_set()
         assert asyncio.all_tasks() == {asyncio.current_task()}
