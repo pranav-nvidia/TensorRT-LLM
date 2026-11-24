@@ -1324,19 +1324,36 @@ class TestEmbedsParts:
             parse_chat_message_content_part(part, mm_tracker)
 
     @pytest.mark.parametrize(
-        "failure", ["limit_same_message", "limit_next_message", "tool_call", "registration"]
+        ("failure", "match"),
+        [
+            ("limit_same_message", "exceed the"),
+            ("limit_next_message", "exceed the"),
+            ("tool_call", "must be valid JSON"),
+            ("registration", "Unknown modality"),
+        ],
     )
-    def test_failed_parse_closes_parked_decoders(self, monkeypatch, failure):
+    def test_failed_parse_closes_parked_decoders(self, monkeypatch, failure, match):
         import gc
+        import inspect
         import warnings
 
         import torch
 
         data = _b64_tensor(torch.zeros(16, 16))
-        monkeypatch.setenv(_chat_utils.MM_EMBEDS_MAX_BYTES_ENV, str(len(data)))
+        parts = 3 if failure == "registration" else 1
+        monkeypatch.setenv(_chat_utils.MM_EMBEDS_MAX_BYTES_ENV, str(parts * len(data)))
         decoder = AsyncMock()
         monkeypatch.setattr(_chat_utils, "async_load_base64_tensor", decoder)
+        loads = []
+        parse_embeds_part = _chat_utils._parse_embeds_part
+
+        def recording_parse(*args, **kwargs):
+            loads.append(parse_embeds_part(*args, **kwargs))
+            return loads[-1]
+
+        monkeypatch.setattr(_chat_utils, "_parse_embeds_part", recording_parse)
         part = {"type": "image_embeds", "image_embeds": {"data": data}}
+        model_type = "qwen2_vl"
         if failure == "limit_same_message":
             messages = [{"role": "user", "content": [part, part]}]
         elif failure == "limit_next_message":
@@ -1345,16 +1362,19 @@ class TestEmbedsParts:
             tool_call = {"id": "c", "type": "function", "function": {"name": "f", "arguments": "{"}}
             messages = [{"role": "assistant", "content": [part], "tool_calls": [tool_call]}]
         else:
-            messages = [{"role": "user", "content": [part]}]
-        # A model type with no image placeholder fails to register the part.
-        model_type = "dummy" if failure == "registration" else "qwen2_vl"
+            # The image registers; the image-only model then rejects the video.
+            video = {"type": "video_embeds", "video_embeds": {"data": data}}
+            messages = [{"role": "user", "content": [part, video, part]}]
+            model_type = "llava_next"
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            with pytest.raises((ValueError, TypeError)):
+            with pytest.raises((ValueError, TypeError), match=match):
                 parse_chat_messages_coroutines(
                     messages, MagicMock(), None, model_type_override=model_type
                 )
             gc.collect()
+        assert loads
+        assert all(inspect.getcoroutinestate(load) == inspect.CORO_CLOSED for load in loads)
         decoder.assert_not_called()
         assert not [w for w in caught if "never awaited" in str(w.message)]
 
