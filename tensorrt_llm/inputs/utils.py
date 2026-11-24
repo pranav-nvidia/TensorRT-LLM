@@ -386,17 +386,24 @@ def _b64decode_strict(text: str, strip_whitespace: bool = False) -> bytes:
         def decode(piece: str) -> bytes:
             return base64.b64decode(piece, validate=True)
 
-    parts, carry = [], ""
+    parts, carry, padded = [], "", False
     for start in range(0, len(text), _BASE64_SLICE_CHARS):
         piece = text[start:start + _BASE64_SLICE_CHARS]
         if strip_whitespace:
             piece = piece.translate(_BASE64_WHITESPACE)
+        if padded:
+            # Only stripped whitespace may follow the padding.
+            if piece:
+                raise ValueError("data after padding")
+            continue
         piece = carry + piece
         if start + _BASE64_SLICE_CHARS < len(text):
             cut = len(piece) - len(piece) % 4
             piece, carry = piece[:cut], piece[cut:]
             if "=" in piece:
-                raise ValueError("padding before the end of the data")
+                if carry:
+                    raise ValueError("data after padding")
+                padded = True
         else:
             carry = ""
         parts.append(decode(piece))
