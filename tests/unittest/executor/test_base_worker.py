@@ -1093,29 +1093,55 @@ def _prompt_embeds_worker(torch_dtype: str,
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "dtype, value, admitted",
+    "case, match",
     [
-        # The float16 limit, the largest bfloat16 below it, and the next value of each.
-        (torch.float32, 65504.0, True),
-        (torch.float32, 65536.0, False),
-        (torch.bfloat16, 65280.0, True),
-        (torch.bfloat16, 65536.0, False),
+        ("speculative_decoding", "with speculative decoding"),
+        ("attention_dp", "with attention data parallelism"),
+        ("context_parallel", "with context parallelism"),
+        ("model_refusal", "by SimpleNamespace: it reads token ids"),
+        ("hidden_size",
+         r"hidden size \(3\) does not match the model hidden size \(4\)"),
+        ("past_prompt", "positions exceed the prompt length"),
+        # The float16 limit, the largest bfloat16 below it, and 65536 in each.
+        ("float32_at_limit", None),
+        ("float32_above_limit", "float16 range"),
+        ("bfloat16_below_limit", None),
+        ("bfloat16_above_limit", "float16 range"),
     ])
-def test_prompt_embeds_float16_range(dtype: torch.dtype, value: float,
-                                     admitted: bool) -> None:
-    # A float16 model admits rows of a wider dtype up to the float16 limit.
+def test_prompt_embeds_admission(case: str, match: str | None) -> None:
+    # Each rejection reaches the caller with its reason; the worker serves a float16 model.
     from tensorrt_llm.inputs.prompt_embeds import build_prompt_embeds
 
-    _, embeds = build_prompt_embeds(
-        None, torch.tensor([[0.5, -value, 1.0, 2.0]], dtype=dtype))
-    request = GenerationRequest([1],
+    worker = _prompt_embeds_worker("float16")
+    rows, prompt_len = torch.ones(2, 4), 2
+    if case == "speculative_decoding":
+        worker.llm_args.speculative_config = object()
+    elif case == "attention_dp":
+        worker.llm_args.parallel_config.enable_attention_dp = True
+    elif case == "context_parallel":
+        worker.llm_args.parallel_config.cp_size = 2
+    elif case == "model_refusal":
+        worker.engine.model_engine.model.prompt_embeds_config_unsupported_reason = (
+            lambda: "it reads token ids")
+    elif case == "hidden_size":
+        rows = torch.ones(2, 3)
+    elif case == "past_prompt":
+        prompt_len = 1
+    else:
+        value = {
+            "float32_at_limit": 65504.0,
+            "bfloat16_below_limit": 65280.0
+        }.get(case, 65536.0)
+        dtype = torch.float32 if case.startswith("float32") else torch.bfloat16
+        rows = torch.tensor([[0.5, -value, 1.0, 2.0]], dtype=dtype)
+    _, embeds = build_prompt_embeds(None, rows)
+    request = GenerationRequest(list(range(prompt_len)),
                                 SamplingParams(max_tokens=1),
                                 prompt_embeds=embeds)
-    worker = _prompt_embeds_worker("float16")
-    if admitted:
+    if match is None:
         BaseWorker._check_prompt_embeds(worker, request)
     else:
-        with pytest.raises(RequestError, match="float16 range"):
+        with pytest.raises(RequestError, match=match):
             BaseWorker._check_prompt_embeds(worker, request)
 
 
