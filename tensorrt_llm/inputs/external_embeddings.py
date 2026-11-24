@@ -125,6 +125,10 @@ def _parse_item(modality: str, index: int, entry: Any) -> ExternalEmbeddingItem:
         raise ValueError(f"{name} has unknown keys {sorted(unknown)}")
     if "mm_embeddings" not in entry:
         raise ValueError(f"{name} is missing 'mm_embeddings'")
+    # The cache key hashes the metadata as passed, and None has no hash.
+    absent = sorted(key for key, value in entry.items() if value is None)
+    if absent:
+        raise ValueError(f"{name}: omit {absent} instead of passing None")
     grid_key = f"{modality}_grid_thw"
     other_grid_key = "video_grid_thw" if modality == "image" else "image_grid_thw"
     if other_grid_key in entry:
@@ -135,7 +139,7 @@ def _parse_item(modality: str, index: int, entry: Any) -> ExternalEmbeddingItem:
                 raise ValueError(f"{name}: '{key}' only applies to video")
 
     grid = None
-    if entry.get(grid_key) is not None:
+    if grid_key in entry:
         grid = _as_int_tuple(entry[grid_key], grid_key)
         if len(grid) != 3:
             raise ValueError(f"{name}: {grid_key} must have 3 entries (t, h, w), got {grid}")
@@ -143,7 +147,7 @@ def _parse_item(modality: str, index: int, entry: Any) -> ExternalEmbeddingItem:
             raise ValueError(f"{name}: {grid_key} entries must be positive, got {grid}")
 
     def optional(key: str, convert: Callable[[Any, str], Any]) -> Any:
-        return convert(entry[key], key) if entry.get(key) is not None else None
+        return convert(entry[key], key) if key in entry else None
 
     return ExternalEmbeddingItem(
         modality,

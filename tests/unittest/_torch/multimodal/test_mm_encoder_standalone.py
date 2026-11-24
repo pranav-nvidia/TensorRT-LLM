@@ -1248,12 +1248,12 @@ def test_external_video_embeddings_chunked_prefill_and_reuse(
     untied = _greedy_tokens_before_first_tie(reference.outputs[0])
     assert len(untied) >= 4
     assert first.outputs[0].token_ids[:len(untied)] == untied
-    assert second.cached_tokens > 0
-    assert second.outputs[0].token_ids[:len(untied)] == untied
-
     # KV before the first embedding slot does not depend on the video.
     text_prefix = reference.prompt_token_ids.index(
         llm.input_processor.config.video_token_id)
+    # The replay reuses KV past the text before the video.
+    assert second.cached_tokens > text_prefix
+    assert second.outputs[0].token_ids[:len(untied)] == untied
     item = external["multi_modal_embeddings"]["video"][0]
     changed_content = copy.deepcopy(external)
     changed_content["multi_modal_embeddings"]["video"][0]["mm_embeddings"] = (

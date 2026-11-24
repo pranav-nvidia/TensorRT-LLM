@@ -353,6 +353,11 @@ def test_qwen2_5_bare_video_placeholder_is_rejected():
             "needs image placeholders framed",
         ),
         ({"image": None}, "<|image_pad|>", "must be a list"),
+        (
+            {"video": [_video(1, 2, 2, timestamps=[0.0], fps=None)]},
+            "<|video_pad|>",
+            r"omit \['fps'\] instead of passing None",
+        ),
         ({"image": [torch.ones(4, _HIDDEN, dtype=torch.int32)]}, "<|image_pad|>", "floating"),
         ({"audio": [torch.ones(4, _HIDDEN)]}, "<|image_pad|>", "Unsupported modalities"),
         (
