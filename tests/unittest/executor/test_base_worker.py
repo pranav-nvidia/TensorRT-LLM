@@ -1107,12 +1107,17 @@ def _prompt_embeds_worker(torch_dtype: str,
         ("float32_above_limit", "float16 range"),
         ("bfloat16_below_limit", None),
         ("bfloat16_above_limit", "float16 range"),
+        # A bfloat16 model: float32 rows up to its limit, and the float32 limit.
+        ("float32_at_bfloat16_limit", None),
+        ("float32_above_bfloat16_limit", "bfloat16 range"),
     ])
 def test_prompt_embeds_admission(case: str, match: str | None) -> None:
-    # Each rejection reaches the caller with its reason; the worker serves a float16 model.
+    # Each rejection reaches the caller with its reason; the worker serves a
+    # float16 model unless the case names bfloat16's limit.
     from tensorrt_llm.inputs.prompt_embeds import build_prompt_embeds
 
-    worker = _prompt_embeds_worker("float16")
+    worker = _prompt_embeds_worker(
+        "bfloat16" if case.endswith("bfloat16_limit") else "float16")
     rows, prompt_len = torch.ones(2, 4), 2
     if case == "speculative_decoding":
         worker.llm_args.speculative_config = object()
@@ -1130,7 +1135,9 @@ def test_prompt_embeds_admission(case: str, match: str | None) -> None:
     else:
         value = {
             "float32_at_limit": 65504.0,
-            "bfloat16_below_limit": 65280.0
+            "bfloat16_below_limit": 65280.0,
+            "float32_at_bfloat16_limit": torch.finfo(torch.bfloat16).max,
+            "float32_above_bfloat16_limit": torch.finfo(torch.float32).max,
         }.get(case, 65536.0)
         dtype = torch.float32 if case.startswith("float32") else torch.bfloat16
         rows = torch.tensor([[0.5, -value, 1.0, 2.0]], dtype=dtype)

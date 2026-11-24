@@ -468,15 +468,19 @@ class BaseWorker(GenerationExecutor):
         model_dtype = getattr(config, "torch_dtype", None)
         if isinstance(model_dtype, str):
             model_dtype = getattr(torch, model_dtype, None)
-        # A generation-only request carries no rows to range-check. Compared in
-        # float32: the float16 limit rounds up to 65536 as a bfloat16 scalar.
-        if (model_dtype == torch.float16 and prompt_embeds.embeds is not None
-                and prompt_embeds.dtype != torch.float16
+        # The overlay casts rows to the model dtype, where values beyond its
+        # range become inf. A generation-only request carries no rows to
+        # check. Compared in float32: the float16 limit rounds up to 65536 as
+        # a bfloat16 scalar.
+        if (model_dtype in (torch.float16, torch.bfloat16)
+                and prompt_embeds.embeds is not None
+                and prompt_embeds.dtype != model_dtype
                 and bool(prompt_embeds.embeds.abs().max().float() > torch.finfo(
-                    torch.float16).max)):
+                    model_dtype).max)):
             raise RequestError(
-                "prompt_embeds holds values outside the float16 range of "
-                "this model.")
+                f"prompt_embeds holds values outside the "
+                f"{str(model_dtype).removeprefix('torch.')} range of this "
+                "model.")
         if int(prompt_embeds.positions[-1]) >= request.prompt_len:
             raise RequestError(
                 "prompt_embeds positions exceed the prompt length.")

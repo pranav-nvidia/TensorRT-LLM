@@ -467,10 +467,10 @@ def test_disaggregated_handoff() -> None:
 @pytest.mark.parametrize("model_dtype", [torch.float16, torch.bfloat16])
 def test_rows_staged_in_model_dtype(model_dtype: torch.dtype) -> None:
     # Rows of every caller dtype upload in the model dtype, so a mixed batch is
-    # not promoted; float32 rows at the float16 limit stay finite.
+    # not promoted; float32 rows at the model dtype's limit stay finite.
     from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
 
-    limit = torch.finfo(torch.float16).max
+    limit = torch.finfo(model_dtype).max
     caller_rows = [
         torch.tensor([[limit, -limit, 1 / 3, 0.1]], dtype=torch.float32),
         torch.tensor([[0.1, 0.2, 0.3, 0.4], [1.5, -2.5, 3.5, 4.5]], dtype=torch.bfloat16),
