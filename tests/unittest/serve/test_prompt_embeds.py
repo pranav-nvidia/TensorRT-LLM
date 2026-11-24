@@ -4,6 +4,7 @@
 
 import base64
 import io
+import json
 from types import SimpleNamespace
 from typing import Any, Dict, Iterator, List
 
@@ -156,6 +157,19 @@ def test_completion_request_byte_limit(serve_env: ServeTestEnv, monkeypatch) -> 
     assert len(server.generator.generate_calls) == 1
 
 
+def test_completion_line_wrapped_payload_near_limit(serve_env: ServeTestEnv, monkeypatch) -> None:
+    """Line breaks in a payload do not count toward the request byte limit."""
+    payload = _b64(torch.zeros(16, HIDDEN))
+    limit = len(base64.b64decode(payload))
+    wrapped = "\r\n".join(payload[i : i + 76] for i in range(0, len(payload), 76))
+    assert len(wrapped) > 4 * ((limit + 2) // 3)
+    monkeypatch.setenv(PROMPT_EMBEDS_MAX_BYTES_ENV, str(limit))
+    server, client = _client(serve_env)
+    with client:
+        assert _completion(client, prompt_embeds=wrapped).status_code == 200
+    assert len(server.generator.generate_calls) == 1
+
+
 @pytest.mark.parametrize(
     "body",
     [
@@ -304,9 +318,15 @@ def test_harmony_refuses_parts(serve_env: ServeTestEnv) -> None:
     assert server.generator.generate_calls == []
 
 
+@pytest.mark.parametrize("escaped", [False, True])
 @pytest.mark.parametrize("enabled", [True, False])
-def test_harmony_refuses_parts_in_tool_messages(serve_env: ServeTestEnv, enabled: bool) -> None:
-    """A tool message with tool_call_id validates its content lazily; it is still refused."""
+def test_harmony_refuses_parts_in_tool_messages(
+    serve_env: ServeTestEnv, enabled: bool, escaped: bool
+) -> None:
+    """A tool message with tool_call_id validates its content lazily; it is still refused.
+
+    ``escaped`` spells the part type with a JSON unicode escape.
+    """
     server = serve_env.build_openai_server(
         AggConfig(model_type="gpt_oss", enable_prompt_embeds=enabled)
     )
@@ -321,8 +341,14 @@ def test_harmony_refuses_parts_in_tool_messages(serve_env: ServeTestEnv, enabled
         },
         {"role": "tool", "tool_call_id": "c1", "content": [_part(torch.zeros(2, 4))]},
     ]
+    body = json.dumps({"model": "fake-model", "max_tokens": 1, "messages": messages})
+    if escaped:
+        body = body.replace('"prompt_embeds"', '"prompt_\\u0065mbeds"')
+        assert '"prompt_embeds"' not in body
     with serve_env.client(server.app) as client:
-        response = _chat(client, messages)
+        response = client.post(
+            "/v1/chat/completions", content=body, headers={"content-type": "application/json"}
+        )
     assert response.status_code == 400
     assert "prompt_embeds" in response.json()["message"]
     assert server.generator.generate_calls == []
@@ -339,10 +365,16 @@ def _sentencepiece_tokenizer() -> Any:
     return AutoTokenizer.from_pretrained(str(path))
 
 
-def test_splice_text_after_part_reads_as_continuation() -> None:
-    """SentencePiece would add a leading-space token to text after a part; it must not."""
+@pytest.mark.parametrize("offsets", [True, False])
+def test_splice_text_after_part_reads_as_continuation(offsets: bool) -> None:
+    """SentencePiece would add a leading-space token to text after a part; it must not.
+
+    Without ``offsets`` the tokenizer offers only ``encode``, as a slow one does.
+    """
     hf = _sentencepiece_tokenizer()
-    res = SimpleNamespace(tokenizer=hf)
+    res = SimpleNamespace(
+        tokenizer=hf if offsets else SimpleNamespace(is_fast=False, encode=hf.encode)
+    )
 
     def tokenize(text: str, add_special_tokens: bool) -> List[int]:
         return hf.encode(text, add_special_tokens=add_special_tokens)
@@ -394,6 +426,20 @@ def test_splice_special_tokens_only_on_first_segment() -> None:
     )
     assert out["prompt_token_ids"] == [99, 0, 0, ord("a"), ord("b")]
     assert out["prompt_embeds_mask"] == [False, True, True, False, False]
+
+
+def test_splice_refuses_text_without_a_continuation() -> None:
+    """Text after a part that no probe can precede is refused, not tokenized on its own."""
+    part = ChatPromptEmbedsPart(marker="<M>", data="")
+    with pytest.raises(UnsupportedRenderError, match="continuation"):
+        splice_chat_prompt_embeds(
+            "a<M>b",
+            [part],
+            [torch.zeros(1, 4)],
+            _identity_tokenize,
+            False,
+            continuation=lambda text: None,
+        )
 
 
 @pytest.mark.parametrize(

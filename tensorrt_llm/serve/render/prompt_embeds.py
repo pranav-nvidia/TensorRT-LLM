@@ -39,15 +39,26 @@ def resource_tokenizer(res: RenderResources) -> Tokenize:
     return tokenize
 
 
-def resource_continuation(res: RenderResources) -> Optional[Continue]:
+def resource_continuation(res: RenderResources) -> Continue:
     """Return ``continuation(text)``: ids of ``text`` as it reads mid-prompt.
 
-    Uses offset mapping of a fast Hugging Face tokenizer; returns None when the
-    tokenizer has none, and segments are then tokenized on their own.
+    ``text`` is tokenized after a short probe that is then cut off: by offset
+    mapping with a fast Hugging Face tokenizer, else by the probe's own ids.
+    Returns None for ``text`` when every probe merges into its first token.
     """
     hf_tokenizer = getattr(res.tokenizer, "tokenizer", res.tokenizer)
     if not getattr(hf_tokenizer, "is_fast", False):
-        return None
+
+        def id_continuation(text: str) -> Optional[List[int]]:
+            """Tokenize ``text`` after a probe and drop the probe's ids."""
+            for probe in _CONTINUATION_PROBES:
+                head = hf_tokenizer.encode(probe, add_special_tokens=False)
+                ids = hf_tokenizer.encode(probe + text, add_special_tokens=False)
+                if ids[: len(head)] == head:
+                    return ids[len(head) :]
+            return None
+
+        return id_continuation
 
     def continuation(text: str) -> Optional[List[int]]:
         """Tokenize ``text`` after a probe and keep the tokens past the probe."""
@@ -100,7 +111,8 @@ def splice_chat_prompt_embeds(
         add_special_tokens: Whether the whole prompt gets the tokenizer's
             special tokens (e.g. BOS, EOS), placed once around it.
         continuation: Tokenizes text that follows a part as it reads
-            mid-prompt; without it such text is tokenized on its own.
+            mid-prompt (see ``resource_continuation``); without it such text is
+            tokenized on its own.
 
     Returns:
         ``prompt_token_ids``, ``prompt_embeds`` (the parts' rows in prompt
@@ -129,8 +141,14 @@ def splice_chat_prompt_embeds(
         """Append the ids of one text segment."""
         if not segment:
             return
-        ids = continuation(segment) if after_part and continuation is not None else None
-        if ids is None:
+        if after_part and continuation is not None:
+            ids = continuation(segment)
+            if ids is None:
+                raise UnsupportedRenderError(
+                    "The text after a prompt_embeds part cannot be tokenized as "
+                    "a continuation with this tokenizer."
+                )
+        else:
             ids = tokenize(segment, False)
         token_ids.extend(ids)
         mask.extend([False] * len(ids))

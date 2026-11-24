@@ -106,9 +106,13 @@ def _assert_same_greedy_path(reference: Any, candidate: Any) -> None:
     """Assert two greedy choices agree token by token, except across a near-tie.
 
     Up to the first differing token the chosen tokens' logprobs must match; at
-    that token both picks must be near-tied in the reference distribution.
+    that token both picks must be near-tied in the reference distribution. The
+    candidate must have finished, with every token when it ran to the limit.
     """
     ref_lp, cand_lp = reference.logprobs, candidate.logprobs
+    assert candidate.finish_reason is not None
+    if candidate.finish_reason == "length":
+        assert len(cand_lp.tokens) == MAX_TOKENS, len(cand_lp.tokens)
     for step, (ref_tok, cand_tok) in enumerate(zip(ref_lp.tokens, cand_lp.tokens)):
         ref_top = ref_lp.top_logprobs[step]
         if ref_tok != cand_tok:
@@ -148,6 +152,7 @@ def test_completion_batch_and_stream(
     streamed = [
         SimpleNamespace(
             text="",
+            finish_reason=None,
             logprobs=SimpleNamespace(tokens=[], token_logprobs=[], top_logprobs=[]),
         )
         for _ in payloads
@@ -156,6 +161,7 @@ def test_completion_batch_and_stream(
         for choice in chunk.choices:
             out = streamed[choice.index]
             out.text += choice.text
+            out.finish_reason = choice.finish_reason or out.finish_reason
             if choice.logprobs is not None:
                 out.logprobs.tokens += choice.logprobs.tokens
                 out.logprobs.token_logprobs += choice.logprobs.token_logprobs

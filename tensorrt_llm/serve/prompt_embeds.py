@@ -94,6 +94,8 @@ def decode_prompt_embeds(
         The tensors, in payload order.
     """
     encoded_limit = 4 * ((max_bytes + 2) // 3)
+    # load_base64_tensor's allowance for line-wrapped (MIME) text.
+    encoded_limit += encoded_limit // 38 + 2 * len(payloads)
     if sum(len(p) if isinstance(p, str) else 0 for p in payloads) > encoded_limit:
         raise ValueError(
             f"prompt_embeds payloads exceed the {max_bytes}-byte request limit "

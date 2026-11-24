@@ -333,15 +333,16 @@ async def _raw_body_has_prompt_embeds(raw_request: Optional[Request]) -> bool:
 
     Validated messages can hide content behind a single-pass iterator (e.g. a
     tool message with ``tool_call_id``), so the raw JSON is checked as well;
-    it is parsed only when the bytes mention the part type.
+    it is parsed only when the bytes mention the part type or hold a unicode
+    escape, the one JSON escape that could spell it.
     """
     if raw_request is None:
         return False
     body = await raw_request.body()
-    if b'"prompt_embeds"' not in body:
+    if b'"prompt_embeds"' not in body and b"\\u" not in body:
         return False
     try:
-        messages = json.loads(body).get("messages")
+        messages = (await raw_request.json()).get("messages")
     except (ValueError, AttributeError):
         return False
     return has_prompt_embeds_parts(messages)
