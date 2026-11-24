@@ -144,10 +144,8 @@ class GenerationExecutor(ABC):
         ``prompt_adapter_request`` is deprecated. Prompt adapters are unsupported;
         omit this argument or pass None.
 
-        ``prompt_embeds`` must come from
-        ``tensorrt_llm.inputs.prompt_embeds.build_prompt_embeds`` and is owned
-        by the request from here on: its digest is trusted as the KV cache
-        identity, so the caller must not modify its tensors.
+        ``prompt_embeds`` is internal: only ``LLM`` builds it (``build_prompt_embeds``),
+        and its digest is trusted as the KV cache identity.
         """
         assert isinstance(prompt_token_ids, np.ndarray) or isinstance(
             prompt_token_ids[0], int)
@@ -181,6 +179,9 @@ class GenerationExecutor(ABC):
         # release memory in time
         if hasattr(request, "multimodal_params"):
             del request.multimodal_params
+        if prompt_embeds is not None:
+            # The worker holds the submitted rows; the client keeps the identity.
+            request.prompt_embeds = prompt_embeds.identity_only()
         return result
 
     def generate(
@@ -506,6 +507,10 @@ class GenerationExecutor(ABC):
 
     def get_startup_metrics(self) -> dict | None:
         """Return startup metrics, or ``None`` when temporarily unavailable."""
+        return {}
+
+    def get_engine_config(self) -> dict:
+        """Return resolved model and KV-cache dtype metadata from the runtime."""
         return {}
 
     @staticmethod

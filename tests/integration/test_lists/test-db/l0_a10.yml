@@ -47,6 +47,7 @@ l0_a10:
   - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_adp_dummy_draft_rollback.py
   - unittest/_torch/pyexecutor/connectors/test_kv_cache_layout.py
   - unittest/_torch/pyexecutor/kv_cache/test_kv_connector_v2_prefix_real_manager.py
+  - unittest/_torch/speculative/test_dspark_recompute_tail_claim.py
   - unittest/_torch/pyexecutor/test_resource_manager.py
   - unittest/_torch/pyexecutor/test_profile_endpoints.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
@@ -129,7 +130,6 @@ l0_a10:
   - unittest/visual_gen/test_executor_shared_tensor_ipc.py
   - unittest/visual_gen/test_iteration_stats.py
   - unittest/visual_gen/test_media_encoding.py
-  - unittest/_torch/visual_gen/test_qwen_image_infer.py
   - unittest/_torch/visual_gen/test_qwen_image_pipeline.py
   - unittest/_torch/visual_gen/test_qwen_image_pipeline_config.py
   - unittest/_torch/visual_gen/test_qwen_image_layered_pipeline_config.py
@@ -138,6 +138,7 @@ l0_a10:
   - unittest/llmapi/test_whisper_suppress_tokens_processor.py
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu1"
   - unittest/llmapi/test_llm_prompt_embeds.py
+  - unittest/llmapi/test_llm_prompt_embeds_vlm.py
   # executor
   - unittest/executor/test_spec_dec_stats_pairing.py
   - unittest/executor/test_spec_decode_stats_payload.py

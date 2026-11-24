@@ -19,6 +19,7 @@ import os
 import threading
 from typing import Callable, List, Optional
 
+from .._torch.pyexecutor.llm_request import release_undelivered_response
 from .._utils import nvtx_range_debug
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue
@@ -119,7 +120,7 @@ class RpcExecutorMixin:
         # submit is a fire-and-forget operation, don't need to wait for response
         try:
             with nvtx_range_debug("RPCExecutor.submit", color="green", category="Proxy"):
-                self.rpc_client.submit(request).remote(need_response=False)
+                self.rpc_client.submit_from_proxy(request).remote(need_response=False)
         except Exception:
             # The request never reached the worker: drop the registration so
             # the id does not linger in _results.
@@ -140,6 +141,7 @@ class RpcExecutorMixin:
 
                 if client_id not in self._results:
                     logger.warning(f"Received response for unknown client_id: {client_id}")
+                    release_undelivered_response(r)
                     continue
 
                 queue = self._results[client_id].queue

@@ -6,10 +6,11 @@
 import dataclasses
 import os
 import time
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from .executor_request_queue import RequestQueueItem
+    from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
     from .scheduler import WaitingQueue
     from .scheduler.adp_router import ADPRouter
 
@@ -168,6 +169,26 @@ def get_from_waiting_queue(
     return items
 
 
+def drain_queued_items(
+    waiting_queue: "WaitingQueue", request_queue: "ExecutorRequestQueue"
+) -> Iterator["RequestQueueItem"]:
+    """Yield waiting items, then incoming items other than the shutdown signal."""
+    while waiting_queue:
+        yield waiting_queue.pop_request()
+
+    # Also drain executor_request_queue so items already queued
+    # but not yet fetched by the main loop are not scheduled
+    # after the CUDA context is corrupted. Safe to use empty()
+    # here because is_shutdown is True and the queue's active
+    # flag is about to be set False, so no new items arrive.
+    raw_queue = request_queue.get_request_queue()
+    while not raw_queue.empty():
+        item = raw_queue.get_nowait()
+        if item.is_shutdown_request:
+            continue
+        yield item
+
+
 def partition_context_for_helix(
     input_token_ids: np.ndarray, cp_rank: int, cp_size: int, tokens_per_block: int
 ) -> tuple[list[int], list[int], int, int]:
@@ -228,6 +249,8 @@ def merge_requests_to_llm_requests(
     new_requests: list["RequestQueueItem"],
     exclude_last_generation_logits: bool,
     track_unique_tokens: bool = True,
+    *,
+    vocab_size: int | None = None,
 ) -> list[LlmRequest]:
     """Merge RequestQueueItems to LlmRequests (basic case without CP).
 
@@ -247,6 +270,8 @@ def merge_requests_to_llm_requests(
             exclude_last_generation_logits,
             input_token_ids=req_item.prompt_token_ids,
             track_unique_tokens=track_unique_tokens,
+            locality_domain_id=req_item.locality_domain_id,
+            vocab_size=vocab_size,
         )
         req_with_children.append(req)
         if req.child_requests:
@@ -260,11 +285,14 @@ def merge_helix_requests(
     cp_size: int,
     tokens_per_block: int,
     exclude_last_generation_logits: bool,
+    *,
+    vocab_size: int | None = None,
 ) -> list[LlmRequest]:
     """Merge requests for Helix CP.
 
-    Note: Helix parallelism is a decode-only feature run with disaggregated serving.
-    This function gets called on gen server during initialization of a new request.
+    Called only for disaggregated Helix, on the generation server when a new
+    request is initialized; it slices the prompt across CP ranks. Aggregated
+    Helix keeps the full prompt on every rank (see ``merge_requests``).
 
     Args:
         new_requests: List of RequestQueueItem objects.
@@ -291,6 +319,8 @@ def merge_helix_requests(
             exclude_last_generation_logits=exclude_last_generation_logits,
             input_token_ids=input_ids_this_rank,
             position_ids=position_ids_this_rank,
+            locality_domain_id=req_item.locality_domain_id,
+            vocab_size=vocab_size,
         )
         req.total_input_len_cp = input_len
         req.seqlen_this_rank_cp = len(input_ids_this_rank)
@@ -316,6 +346,8 @@ def merge_requests(
     exclude_last_generation_logits: bool,
     is_disagg: bool,
     track_unique_tokens: bool = True,
+    *,
+    vocab_size: int | None = None,
 ) -> list[LlmRequest]:
     """Merge RequestQueueItems to LlmRequests based on CP configuration.
 
@@ -352,13 +384,16 @@ def merge_requests(
                     cp_size=cp_size,
                     tokens_per_block=cp_config["tokens_per_block"],
                     exclude_last_generation_logits=exclude_last_generation_logits,
+                    vocab_size=vocab_size,
                 )
-            return merge_requests_to_llm_requests(new_requests, exclude_last_generation_logits)
+            return merge_requests_to_llm_requests(
+                new_requests, exclude_last_generation_logits, vocab_size=vocab_size
+            )
         elif cp_size > 1:
             raise NotImplementedError(f"Unsupported cp type {cp_type.name}.")
 
     return merge_requests_to_llm_requests(
-        new_requests, exclude_last_generation_logits, track_unique_tokens
+        new_requests, exclude_last_generation_logits, track_unique_tokens, vocab_size=vocab_size
     )
 
 
@@ -402,9 +437,27 @@ def _without_prompt(item):
     )
 
 
+def _without_prompt_embeds_rows(item: "RequestQueueItem") -> "RequestQueueItem":
+    """A copy of a queued request whose prompt_embeds rows are left on rank 0.
+
+    TP ranks of the first pipeline stage receive each context chunk's rows from
+    TP rank 0 when it runs (``DecoderInputPreparer._ship_prompt_embeds``); later
+    stages never read them.
+    """
+    request = item.request
+    if not isinstance(request, ExecutorRequest):
+        return item
+    prompt_embeds = request.inputs.prompt_embeds
+    if prompt_embeds is None or prompt_embeds.embeds is None:
+        return item
+    inputs = dataclasses.replace(request.inputs, prompt_embeds=prompt_embeds.for_peer_ranks())
+    return dataclasses.replace(item, request=ExecutorRequest(request.request, inputs))
+
+
 class RequestBroadcaster:
     """Broadcasts requests across distributed ranks (TP, PP, CP).
 
+    Requests go out without their prompt_embeds rows (``_without_prompt_embeds_rows``).
     With ``prompts_to_owners`` the broadcast carries requests without their prompts, and
     ``deliver_prompts`` sends each prompt only to the rank the request is admitted on.
     """
@@ -513,7 +566,7 @@ class RequestBroadcaster:
         payloads = None
         is_root = self.dist.rank == 0
         if is_root and new_requests:
-            payloads = new_requests
+            payloads = self._root_payloads(new_requests)
         if self.sync_clock:
             # Same microsecond encoding as the probe (_broadcast_request_count), so the clock never steps back
             # when consecutive iterations take different routes.
@@ -581,12 +634,9 @@ class RequestBroadcaster:
         self, new_requests: list["RequestQueueItem"]
     ) -> list["RequestQueueItem"]:
         """Broadcast request envelopes across pipeline stages."""
-        if self.prompts_to_owners and self.dist.rank == 0:
-            new_requests = [_without_prompt(item) for item in new_requests]
-        payloads = new_requests
-
         if self.dist.world_size == 1:
-            return payloads
+            return new_requests
+        payloads = self._root_payloads(new_requests) if self.dist.rank == 0 else new_requests
 
         if not self.dist.has_pp:
             return self.dist.broadcast(payloads, root=0)
@@ -623,6 +673,13 @@ class RequestBroadcaster:
             with nvtx_range("send_requests_to_next_pp"):
                 self.send_requests_handler = pp_send_func(payloads, self.dist.next_pp_rank, tag)
 
+        return payloads
+
+    def _root_payloads(self, new_requests: list["RequestQueueItem"]) -> list["RequestQueueItem"]:
+        """Rank 0's copies of ``new_requests`` as broadcast; rank 0 keeps the originals."""
+        payloads = [_without_prompt_embeds_rows(item) for item in new_requests]
+        if self.prompts_to_owners:
+            payloads = [_without_prompt(item) for item in payloads]
         return payloads
 
     @nvtx_range("deliver_prompts")

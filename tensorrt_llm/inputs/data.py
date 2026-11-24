@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Adapt from
 # https://github.com/vllm-project/vllm/blob/2e33fe419186c65a18da6668972d61d7bbc31564/vllm/inputs/data.py
 from typing import Any, Dict, List, Union
@@ -93,43 +95,51 @@ class TokensPrompt(TypedDict):
     prompt_embeds: NotRequired[torch.Tensor]
     """Precomputed ``[K, hidden_size]`` input embeddings for ``K`` prompt positions.
 
-    The dtype must be float16, bfloat16 or float32; the engine converts rows to
-    the model dtype. ``generate`` takes an owned CPU snapshot at submission, so
-    later writes to the caller's tensor have no effect. Each row replaces the
-    token embedding of one prompt position and must equal what the model's
-    input embedding module would produce there, including any scaling it
-    applies. The ids at those positions are placeholders: they still feed
-    repetition penalties, prompt logprobs and KV cache events. KV blocks are
-    shared only between requests with identical ids and rows. Supported only on
-    decoder models that declare ``supports_prompt_embeds``, on the PyTorch
-    backend, without speculative decoding, attention data parallelism, pipeline
-    parallelism or context parallelism. With disaggregated serving the
-    generation-only request must carry the same ``prompt_embeds`` as the
-    context request (only its identity is used there) and the KV cache manager
-    must be V2.
+    Prototype: the prompt_embeds inputs may change. This is the prompt_embeds contract. Rows (float16, bfloat16 or float32) must
+    equal what the model's input embedding module, including any scaling, would
+    produce; ``generate`` snapshots them at submission. The ids at those
+    positions are placeholders that still feed repetition penalties and prompt
+    logprobs; on the V2 KV cache manager, KV cache events report each embedding
+    position as a row key rather than its id. KV blocks are reused only across
+    identical ids and rows; with the V2 KV cache manager and no KV connector,
+    blocks before the first row are shared with plain-token prompts. Models
+    that read ids after the embedding still see the ids there (Gemma4
+    per-layer embeddings use the pad id instead), so their output can depend
+    on the placeholder choice.
+    Requires the PyTorch backend and a model class that opts in
+    (``supports_prompt_embeds``); speculative
+    decoding, attention data parallelism and context parallelism are rejected.
+    Disaggregated serving needs the V2 manager; the generation-only request
+    takes the identity from the context result's ``disaggregated_params`` and
+    needs no rows (any it passes must match).
     """
 
     prompt_embeds_mask: NotRequired[Union[List[bool], torch.Tensor]]
-    """Length-``len(prompt_token_ids)`` bools, True where a ``prompt_embeds`` row
-    replaces the token embedding; rows are consumed in position order. May be
-    omitted when ``prompt_embeds`` has one row per prompt token.
+    """Length-``len(prompt_token_ids)`` bools, True where the next ``prompt_embeds``
+    row replaces the token embedding; optional when there is one row per token.
+    With ``multi_modal_data`` it is required and indexes ``prompt_token_ids``
+    before placeholder expansion; it must not select a placeholder.
     """
 
 
 class EmbedsPrompt(TypedDict):
-    """Schema for a prompt given entirely as precomputed input embeddings."""
+    """Schema for a prompt given entirely as precomputed input embeddings (prototype)."""
 
     prompt_embeds: torch.Tensor
-    """``[L, hidden_size]`` input embeddings, one row per prompt position. See
-    ``TokensPrompt.prompt_embeds`` for the contract. ``LLM.generate`` accepts
-    this dict wherever it accepts a ``TokensPrompt``."""
+    """``[L, hidden_size]``, one row per position; see ``TokensPrompt.prompt_embeds``.
+
+    Every position schedules token id 0 as its placeholder.
+    """
 
 
 PromptInputs = Union[str, List[int], TextPrompt, TokensPrompt]
 
+# Inputs ``LLM.generate`` and ``generate_async`` accept.
+GenerationInputs = Union[PromptInputs, EmbedsPrompt]
+
 
 def prompt_inputs(
-    inputs: Union[PromptInputs, EmbedsPrompt],
+        inputs: GenerationInputs
 ) -> Union[TextPrompt, TokensPrompt, EmbedsPrompt]:
     if isinstance(inputs, str):
         prompt_inputs = TextPrompt(prompt=inputs)

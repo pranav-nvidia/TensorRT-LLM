@@ -43,6 +43,7 @@ from ._arch_index import (MODEL_ARCH_TO_MODULE, SPEC_MODE_TO_MODULE,
                           is_builtin_zoo_module)
 
 if TYPE_CHECKING:
+    from ..recurrent_state_spec import RecurrentStateSpec
     # The checkpoints package imports this module, so import its loader base
     # classes for type checking only.
     from .checkpoints.base_config_loader import BaseConfigLoader
@@ -650,6 +651,19 @@ class PostInitCaller(type):
 TModel = TypeVar("TModel", bound=DecoderModel)
 
 
+def prompt_embeds_unsupported_reason(model: nn.Module) -> Optional[str]:
+    """Return why ``model`` cannot take ``prompt_embeds``, or None if it can.
+
+    A class opts in with ``supports_prompt_embeds``; ``prompt_embeds_config_unsupported_reason``
+    adds config-dependent refusals.
+    """
+    if not getattr(model, "supports_prompt_embeds", False):
+        return "its model class does not support prompt_embeds"
+    if type(model).__module__.startswith("tensorrt_llm._torch.modeling_v2."):
+        return "modeling_v2 implementations do not take engine-supplied embeddings yet"
+    return model.prompt_embeds_config_unsupported_reason()
+
+
 class DecoderModelForCausalLM(nn.Module,
                               Generic[TModel, TConfig],
                               metaclass=PostInitCaller):
@@ -663,18 +677,28 @@ class DecoderModelForCausalLM(nn.Module,
     # The model-specific TorchLlmArgs fields this model implements; the loader
     # rejects a set one that is not listed.
     model_specific_llm_args: ClassVar[frozenset[str]] = frozenset()
-    # True when the input embedding is the only reader of a context token id,
-    # so precomputed rows (tensorrt_llm.inputs.prompt_embeds) can replace it.
-    # Each model opts in after its forward has been audited for other readers.
+    # Opt in once ``forward`` computes the same output from ``inputs_embeds`` as
+    # from ids and every layer that reads ids after the input embedding treats an
+    # embedding row like an image row (``prompt_embeds_model_inputs``).
     supports_prompt_embeds: ClassVar[bool] = False
+
+    def prompt_embeds_config_unsupported_reason(self) -> Optional[str]:
+        """Return why this opted-in model cannot take ``prompt_embeds`` in its config, or None."""
+        return None
 
     def embed_prompt_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Return the input embeddings ``forward`` computes from ``input_ids``.
 
-        The engine overwrites the rows of prompt-embedding positions and passes
-        the result as ``inputs_embeds``.
+        ``[N]`` int token ids on the model device -> ``[N, H]`` model-dtype
+        embeddings, including any scaling the embedding layer applies.
         """
         return self.model.embed_tokens(input_ids)
+
+    def prompt_embeds_model_inputs(
+            self, input_ids: torch.Tensor,
+            embed_rows: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Return extra ``forward`` kwargs; ``embed_rows`` ([K] int64) index ``input_ids`` ([N])."""
+        return {}
 
     @staticmethod
     def _checkpoint_has_lm_head_scale(
@@ -908,6 +932,31 @@ class DecoderModelForCausalLM(nn.Module,
             pretrained_config: The loaded Hugging Face config. Shared model
                 implementations can inspect it to select a preference for the
                 original checkpoint architecture.
+        """
+        return None
+
+    @classmethod
+    def get_recurrent_state_spec(
+        cls,
+        pretrained_config: Any,
+        *,
+        quant_config: Optional[QuantConfig] = None,
+    ) -> Optional['RecurrentStateSpec']:
+        """Return the layer kinds and base recurrent state of the model.
+
+        Architectures whose layers carry recurrent state between steps
+        override this. The answer depends on the configuration alone, so it is
+        available before the model or its cache manager is built. A VLM
+        wrapper forwards to the class of its language model.
+
+        Args:
+            pretrained_config: The loaded Hugging Face config.
+            quant_config: Quantization config; it can select a state dtype.
+
+        Returns:
+            ``None`` for an architecture without recurrent layers. A recurrent
+            architecture whose configuration selects no recurrent layer
+            returns a declaration that has none.
         """
         return None
 
@@ -1355,6 +1404,28 @@ def get_registered_model_class(model_arch: str) -> Optional[Type[nn.Module]]:
     if model_arch not in MODEL_CLASS_MAPPING:
         _ensure_model_registered(model_arch)
     return MODEL_CLASS_MAPPING.get(model_arch)
+
+
+def resolve_recurrent_state_spec(
+    pretrained_config: Any,
+    *,
+    quant_config: Optional[QuantConfig] = None,
+) -> Optional['RecurrentStateSpec']:
+    """Return the recurrent-state declaration of the model class of a config.
+
+    The class is the one registered for ``pretrained_config.architectures[0]``.
+    ``None`` means that class declares no recurrent state, or that no class
+    can be found: the config names no architecture, or the name is not
+    registered.
+    """
+    architectures = getattr(pretrained_config, 'architectures', None)
+    if not architectures:
+        return None
+    model_cls = get_registered_model_class(architectures[0])
+    get_spec = getattr(model_cls, 'get_recurrent_state_spec', None)
+    if get_spec is None:
+        return None
+    return get_spec(pretrained_config, quant_config=quant_config)
 
 
 def is_model_arch_known(model_arch: str) -> bool:

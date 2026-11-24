@@ -719,6 +719,10 @@ class GenerationResultBase:
                     remote_tail_start=remote_tail_start,
                     multimodal_embedding_handles=None,
                     multimodal_input_layout=None,
+                    prompt_embeds=getattr(
+                        getattr(self, "_generation_request", None),
+                        "prompt_embeds", None)
+                    or getattr(existing_disagg_params, "prompt_embeds", None),
                 )
 
             finish_reasons = response_result.finish_reasons
@@ -1251,24 +1255,8 @@ class GenerationResult(GenerationResultBase):
         if isinstance(response, EngineDeadError):
             self._terminal_error = response
             self._done = True
-            self._release_prompt_embeds()
             raise response
-        try:
-            self._handle_response(response)
-        finally:
-            self._release_prompt_embeds()
-
-    def _release_prompt_embeds(self) -> None:
-        """Drop the client copy of prompt-embedding rows once the request is done.
-
-        The rows were sent before any response arrived; the result keeps only
-        their identity so a retained output does not pin the tensor.
-        """
-        prompt_embeds = getattr(self._generation_request, "prompt_embeds", None)
-        if (self._done and prompt_embeds is not None
-                and prompt_embeds.embeds is not None):
-            self._generation_request.prompt_embeds = (
-                prompt_embeds.identity_only())
+        self._handle_response(response)
 
     async def _aresult_step(self):
         assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
@@ -1277,12 +1265,8 @@ class GenerationResult(GenerationResultBase):
         if isinstance(response, EngineDeadError):
             self._terminal_error = response
             self._done = True
-            self._release_prompt_embeds()
             raise response
-        try:
-            self._handle_response(response)
-        finally:
-            self._release_prompt_embeds()
+        self._handle_response(response)
 
     def result(self, timeout: Optional[float] = None) -> "GenerationResult":
         """Wait for the completion of the request, and return the result.

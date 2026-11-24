@@ -278,6 +278,11 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         metrics = self.collective_rpc("get_startup_metrics", target_ranks=0)
         return metrics[0] if metrics and isinstance(metrics[0], dict) else {}
 
+    def get_engine_config(self) -> dict:
+        """Get resolved engine config metadata from rank 0."""
+        config = self.collective_rpc("get_engine_config", target_ranks=0)
+        return config[0] if config and isinstance(config[0], dict) else {}
+
     def submit(self, request: "GenerationRequest") -> "GenerationResult":
         """
         Low-level API to the executor. Return a "future" GenerationResult
@@ -305,7 +310,8 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
 
         try:
             with nvtx_range_debug("rpc_submit"):
-                self.rpc_client.submit(request).remote(need_response=False)
+                self.rpc_client.submit_from_proxy(request).remote(
+                    need_response=False)
         except Exception:
             self._results.pop(request.id, None)
             raise

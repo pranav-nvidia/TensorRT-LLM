@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import dataclasses
 import datetime
 import enum
 import gc
@@ -33,13 +34,15 @@ from tensorrt_llm.logger import logger
 
 from .._torch.peft.lora.manager import LoraManager
 from .._torch.pyexecutor.iteration_stats import IterationStatsRecord
-from .._torch.pyexecutor.llm_request import LlmResponse
+from .._torch.pyexecutor.llm_request import (LlmResponse,
+                                             release_undelivered_response)
 from .._torch.pyexecutor.request_inputs import (ExecutorRequest,
                                                 PythonRequestInputs)
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..bindings.BuildInfo import check_cuda_architecture_supported
+from ..inputs.prompt_embeds import plain_cache_salt, prompt_embeds_cache_salt
 from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
                                         configure_moe_launch_queues,
                                         uses_collective_shutdown)
@@ -405,18 +408,33 @@ class BaseWorker(GenerationExecutor):
                     self._lora_adapter_identities.setdefault(
                         adapter_id, identity)
 
+    def _effective_cache_salt(self,
+                              request: GenerationRequest) -> Optional[str]:
+        """Fold the embedding identity into the salt unless block keys carry it."""
+        if request.prompt_embeds is None or self._kv_cache_keys_prompt_embeds():
+            return plain_cache_salt(request.cache_salt)
+        return prompt_embeds_cache_salt(request.cache_salt,
+                                        request.prompt_embeds.digest)
+
+    def _kv_cache_keys_prompt_embeds(self) -> bool:
+        """Whether block keys carry the rows; KV connectors key by ids and salt."""
+        if self.llm_args is not None and getattr(
+                self.llm_args, "kv_connector_config", None) is not None:
+            return False
+        return self._cache_manager_keys_rows()
+
+    def _cache_manager_keys_rows(self) -> bool:
+        return getattr(getattr(self.engine, "kv_cache_manager", None),
+                       "keys_prompt_embeds_rows", False)
+
     def _check_prompt_embeds(self, request: GenerationRequest) -> None:
         """Reject prompt embeddings this engine cannot place correctly."""
         prompt_embeds = request.prompt_embeds
         if prompt_embeds is None:
             return
-        is_gen_only = (request.disaggregated_params is not None
-                       and request.disaggregated_params.request_type
-                       == "generation_only")
-        if is_gen_only:
-            # Only the salt matters here; the prompt's KV is transferred.
-            return
-        if prompt_embeds.embeds is None:
+        request_type = (request.disaggregated_params.request_type
+                        if request.disaggregated_params is not None else None)
+        if prompt_embeds.embeds is None and request_type != "generation_only":
             raise RequestError("prompt_embeds carries no rows.")
         if self.llm_args is None:
             raise RequestError("prompt_embeds requires the PyTorch backend.")
@@ -426,36 +444,48 @@ class BaseWorker(GenerationExecutor):
         parallel_config = self.llm_args.parallel_config
         if parallel_config.enable_attention_dp:
             unsupported.append("attention data parallelism")
-        if parallel_config.pp_size > 1:
-            unsupported.append("pipeline parallelism")
         if parallel_config.cp_size > 1:
             unsupported.append("context parallelism")
         if unsupported:
             raise RequestError("prompt_embeds is not supported with " +
                                ", ".join(unsupported) + ".")
+        from .._torch.models.modeling_utils import \
+            prompt_embeds_unsupported_reason
         model = self.engine.model_engine.model
-        if not getattr(model, "supports_prompt_embeds", False):
+        reason = prompt_embeds_unsupported_reason(model)
+        if reason is not None:
             raise RequestError(
-                f"prompt_embeds is not supported by {type(model).__name__}.")
-        hidden_size = model.config.hidden_size
+                f"prompt_embeds is not supported by {type(model).__name__}: "
+                f"{reason}.")
+        config = model.config
+        if getattr(config, "hidden_size", None) is None:
+            config = config.text_config
+        hidden_size = config.hidden_size
         if prompt_embeds.hidden_size != hidden_size:
             raise RequestError(
                 f"prompt_embeds hidden size ({prompt_embeds.hidden_size}) "
                 f"does not match the model hidden size ({hidden_size}).")
+        model_dtype = getattr(config, "torch_dtype", None)
+        if isinstance(model_dtype, str):
+            model_dtype = getattr(torch, model_dtype, None)
+        # A generation-only request carries no rows to range-check.
+        if (model_dtype == torch.float16 and prompt_embeds.embeds is not None
+                and prompt_embeds.dtype != torch.float16
+                and bool(prompt_embeds.embeds.abs().max() > torch.finfo(
+                    torch.float16).max)):
+            raise RequestError(
+                "prompt_embeds holds values outside the float16 range of "
+                "this model.")
         if int(prompt_embeds.positions[-1]) >= request.prompt_len:
             raise RequestError(
                 "prompt_embeds positions exceed the prompt length.")
-        if request.disaggregated_params is not None and (
-                request.disaggregated_params.request_type == "context_only"):
-            from .._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
-                KVCacheManagerV2
-
+        if (request_type in ("context_only", "generation_only")
+                and not self._cache_manager_keys_rows()):
             # The V1 transceiver looks up transferred blocks without the
             # request salt that carries the embedding identity.
-            if not isinstance(self.engine.kv_cache_manager, KVCacheManagerV2):
-                raise RequestError(
-                    "prompt_embeds with disaggregated serving requires "
-                    "kv_cache_config.use_kv_cache_manager_v2=True.")
+            raise RequestError(
+                "prompt_embeds with disaggregated serving requires "
+                "kv_cache_config.use_kv_cache_manager_v2=True.")
 
     def _enqueue_request(self,
                          request: GenerationRequest,
@@ -590,6 +620,21 @@ class BaseWorker(GenerationExecutor):
                 return max_tokens
 
         try:
+            # Dense embedding bias uses C++ path, sparse bias uses Python path
+            embedding_bias = request.sampling_params.embedding_bias
+            sparse_embedding_bias = None
+            if embedding_bias is not None:
+                if isinstance(embedding_bias, torch.Tensor):
+                    embedding_bias = embedding_bias.detach().clone()
+                elif isinstance(embedding_bias, list):
+                    embedding_bias = torch.tensor(embedding_bias,
+                                                  dtype=torch.float32)
+                elif isinstance(embedding_bias, tuple):  # EmbeddingBias
+                    sparse_embedding_bias = embedding_bias
+                    embedding_bias = None
+                else:
+                    raise ValueError("Unsupported embedding bias type")
+
             executor_request = tllm.Request(
                 client_id=request.id,
                 input_token_ids=prompt_token_ids,
@@ -606,7 +651,7 @@ class BaseWorker(GenerationExecutor):
                 bad_words=request.sampling_params._get_bad_words(),
                 stop_words=[] if request.sampling_params.ignore_eos else
                 request.sampling_params._get_stop_words(),
-                embedding_bias=request.sampling_params.embedding_bias,
+                embedding_bias=embedding_bias,
                 lora_config=lora_config,
                 multimodal_input=multimodal_input,
                 mrope_config=None,
@@ -615,7 +660,7 @@ class BaseWorker(GenerationExecutor):
                 encoder_input_token_ids=request.encoder_input_token_ids,
                 type=request_type,
                 disagg_request_id=disagg_request_id,
-                cache_salt=request.cache_salt,
+                cache_salt=self._effective_cache_salt(request),
                 priority=request.priority)
             if request.multimodal_params is not None:
                 # Resolve worker-handoff handles before constructing the input envelope.
@@ -636,6 +681,7 @@ class BaseWorker(GenerationExecutor):
                     logprobs_mode=request.sampling_params.logprobs_mode,
                     logprobs_simple_format=request.sampling_params.
                     logprobs_simple_format,
+                    sparse_embedding_bias=sparse_embedding_bias,
                     return_routed_experts=request.sampling_params.
                     return_routed_experts,
                     disaggregated_params=request.disaggregated_params,
@@ -651,10 +697,7 @@ class BaseWorker(GenerationExecutor):
                     arrival_time=request.arrival_time,
                     watermarking=request.sampling_params.watermarking,
                     prompt_trimmed_prefix=trimmed_prefix,
-                    prompt_embeds=(request.prompt_embeds
-                                   if request.prompt_embeds is not None
-                                   and request.prompt_embeds.embeds is not None
-                                   else None),
+                    prompt_embeds=request.prompt_embeds,
                 ),
             )
 
@@ -1034,6 +1077,46 @@ class BaseWorker(GenerationExecutor):
         self._check_sleep_wakeup_preconditions("get_memory_status")
         return self.engine.get_memory_status()
 
+    def get_memory_report(self) -> list[str]:
+        """Explain where GPU memory is going, as readable reports.
+
+        Built by the GPU memory monitor (``tensorrt_llm._torch.memory.monitor``)
+        in every monitor mode, including ``off``. This worker's own report comes
+        first. Under the MPI executor only rank 0 is asked; it adds the other
+        ranks' reports in the monitor's full mode, and otherwise one line per
+        rank saying they were not gathered. A report that could not be built
+        is replaced by a line saying so.
+        """
+        from tensorrt_llm._torch.memory.monitor import current_rank
+        from tensorrt_llm._torch.memory.monitor.providers import NOT_MONITORED
+        from tensorrt_llm._torch.memory.monitor.triggers import report_now
+
+        token = getattr(self.engine, "_memory_monitor_token", None)
+        if token is not None and not token.monitored:
+            # Another executor in this process holds the monitor; a report
+            # would describe that executor's memory.
+            dist = getattr(self.engine, "dist", None)
+            world_size = dist.world_size if dist is not None else 1
+            return [
+                f"rank {rank}: {NOT_MONITORED}" for rank in range(world_size)
+            ]
+        # Answered on an RPC thread, whose current device is not necessarily
+        # the one this worker serves on; report_now selects it.
+        own = report_now(tag="on_demand",
+                         force=True,
+                         device_index=getattr(self.engine, "device_id", None),
+                         save=False)
+        if own is None:
+            dist = getattr(self.engine, "dist", None)
+            rank = dist.rank if dist is not None else current_rank()
+            own = (f"rank {rank}: the report could not be built; "
+                   "see this rank's log")
+        reports = [own]
+        gather = getattr(self.engine, "gather_memory_reports", None)
+        if gather is not None:
+            reports.extend(gather())
+        return reports
+
     def _prepare_sleep_tags(
         self,
         tags: list[ExecutorMemoryType],
@@ -1301,8 +1384,9 @@ class BaseWorker(GenerationExecutor):
                 startup_metrics[model_engine_stage] = dict(model_engine_metrics)
         startup_metrics["py_executor"] = executor_metrics
 
-        model_engine = getattr(self.engine, "model_engine", None)
-        model_loader = getattr(model_engine, "model_loader", None)
+        # An executor without a model engine holds its loader itself.
+        loader_owner = getattr(self.engine, "model_engine", self.engine)
+        model_loader = getattr(loader_owner, "model_loader", None)
         if model_loader is not None:
             startup_metrics["model_loader"] = {
                 **model_loader.metrics,
@@ -1318,6 +1402,28 @@ class BaseWorker(GenerationExecutor):
             }
 
         return startup_metrics
+
+    def get_engine_config(self) -> dict:
+        """Return resolved model and KV-cache dtype metadata from the runtime."""
+        model_engine = getattr(self.engine, "model_engine", None)
+        model_config = getattr(getattr(model_engine, "model", None),
+                               "model_config", None)
+        if model_config is None:
+            return {}
+
+        from .._utils import torch_dtype_to_str
+        dtype = model_config.torch_dtype
+        pretrained_config = getattr(model_config, "pretrained_config", None)
+        if dtype is None and pretrained_config is not None:
+            dtype = pretrained_config.get_text_config().torch_dtype
+        quant_config = getattr(model_config, "quant_config", None)
+        kv_algo = getattr(quant_config, "kv_cache_quant_algo", None)
+        quant_algo = getattr(quant_config, "quant_algo", None)
+        return {
+            "dtype": None if dtype is None else torch_dtype_to_str(dtype),
+            "kv_cache_dtype": None if kv_algo is None else str(kv_algo),
+            "quantization": None if quant_algo is None else str(quant_algo),
+        }
 
     def start_profile(self,
                       output_dir: Optional[str] = None,
@@ -1665,6 +1771,7 @@ class AwaitResponseHelper:
             elif _drop_refused_response(self.worker, response):
                 continue
             elif self.worker._has_background_error():
+                release_undelivered_response(response)
                 response = self.worker._create_error_response(response)
             elif response.has_error():
                 # Convert to ErrorResponse, because tllm.Response cannot be
@@ -1702,7 +1809,15 @@ def _get_params_for_first_rsp(
     assert res is not None
     if not res._params_transmitted:
         res._params_transmitted = True
-        return res.sampling_params, res.postproc_params, res.disaggregated_params
+        disaggregated_params = res.disaggregated_params
+        embeds = getattr(getattr(res, "_generation_request", None),
+                         "prompt_embeds", None)
+        if (embeds is not None and disaggregated_params is not None
+                and disaggregated_params.request_type == "context_only"):
+            # Postproc records have no request to read the identity from.
+            disaggregated_params = dataclasses.replace(
+                disaggregated_params, prompt_embeds=embeds.identity_only())
+        return res.sampling_params, res.postproc_params, disaggregated_params
     return None, None, None
 
 
@@ -1890,6 +2005,7 @@ def _drop_refused_response(worker, response: LlmResponse) -> bool:
         return False
     if response.has_error() or response.result.is_final:
         worker._refused_client_ids.discard(response.client_id)
+    release_undelivered_response(response)
     return True
 
 
@@ -1907,7 +2023,13 @@ def _maybe_wrap_response(
             worker.abort_request(response.client_id)
         return ErrorResponse(response.client_id, str(error),
                              response.request_id)
-    req_perf_metrics = get_metrics_dict(response)
+    # Reading perf metrics deserializes the whole result, and the executor fills
+    # them only for requests that asked; an untracked request is always read.
+    generation_result = worker._results.get(response.client_id)
+    req_perf_metrics = None
+    if (generation_result is None
+            or generation_result.sampling_params.return_perf_metrics):
+        req_perf_metrics = get_metrics_dict(response)
     if logprobs_result or req_perf_metrics:
         response = ResponseWrapper(response, logprobs_result, req_perf_metrics)
     return response

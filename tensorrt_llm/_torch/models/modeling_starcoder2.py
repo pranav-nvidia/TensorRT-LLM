@@ -245,6 +245,8 @@ class Starcoder2Model(DecoderModel):
 
 @register_auto_model("Starcoder2ForCausalLM")
 class Starcoder2ForCausalLM(DecoderModelForCausalLM[Starcoder2Model, Starcoder2Config]):
+    supports_prompt_embeds = True
+
     def __init__(
         self,
         model_config: ModelConfig[Starcoder2Config],
