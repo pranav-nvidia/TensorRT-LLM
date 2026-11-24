@@ -387,19 +387,23 @@ def parse_chat_message_content(
         mm_data_tracker,
         keep_content_parts=keep_text_parts and is_part_list,
     )
-    if role == "assistant":
-        result.update(
-            _parse_assistant_message_content(message,
-                                             lenient_tool_call_arguments,
-                                             raw_tool_call_arguments))
-    elif role == "tool":
-        result.update(_parse_tool_message_content(message))
-    elif keep_message_tools and role == "system" and message.get("tools"):
-        # Message-level (dynamic) tool declarations: python-renderer chat
-        # templates (kimi_k3) render these as an in-conversation tool
-        # declare block at this message's position. Other models keep the
-        # pre-existing behavior of silently ignoring the key.
-        result["tools"] = message["tools"]
+    try:
+        if role == "assistant":
+            result.update(
+                _parse_assistant_message_content(message,
+                                                 lenient_tool_call_arguments,
+                                                 raw_tool_call_arguments))
+        elif role == "tool":
+            result.update(_parse_tool_message_content(message))
+        elif keep_message_tools and role == "system" and message.get("tools"):
+            # Message-level (dynamic) tool declarations: python-renderer chat
+            # templates (kimi_k3) render these as an in-conversation tool
+            # declare block at this message's position. Other models keep the
+            # pre-existing behavior of silently ignoring the key.
+            result["tools"] = message["tools"]
+    except BaseException:
+        close_pending_loads(media["data"] for media in result["media"])
+        raise
     return result
 
 

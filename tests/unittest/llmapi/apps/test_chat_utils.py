@@ -1297,8 +1297,8 @@ class TestEmbedsParts:
         with pytest.raises(ValueError, match="exceed the"):
             parse_chat_message_content_part(part, mm_tracker)
 
-    @pytest.mark.parametrize("same_message", [True, False])
-    def test_request_byte_limit_closes_parked_decoders(self, monkeypatch, same_message):
+    @pytest.mark.parametrize("failure", ["limit_same_message", "limit_next_message", "tool_call"])
+    def test_failed_parse_closes_parked_decoders(self, monkeypatch, failure):
         import gc
         import warnings
 
@@ -1309,13 +1309,16 @@ class TestEmbedsParts:
         decoder = AsyncMock()
         monkeypatch.setattr(_chat_utils, "async_load_base64_tensor", decoder)
         part = {"type": "image_embeds", "image_embeds": {"data": data}}
-        if same_message:
+        if failure == "limit_same_message":
             messages = [{"role": "user", "content": [part, part]}]
-        else:
+        elif failure == "limit_next_message":
             messages = [{"role": "user", "content": [part]}] * 2
+        else:
+            tool_call = {"id": "c", "type": "function", "function": {"name": "f", "arguments": "{"}}
+            messages = [{"role": "assistant", "content": [part], "tool_calls": [tool_call]}]
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            with pytest.raises(ValueError, match="exceed the"):
+            with pytest.raises(ValueError):
                 parse_chat_messages_coroutines(
                     messages, MagicMock(), None, model_type_override="qwen2_vl"
                 )
