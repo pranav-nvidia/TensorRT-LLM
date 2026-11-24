@@ -4,7 +4,8 @@
 import asyncio
 import base64
 import binascii
-import pickletools
+# The decoder walks pickle opcodes; nothing is unpickled.
+import pickletools  # nosec B403
 import struct
 import sys
 import zipfile
