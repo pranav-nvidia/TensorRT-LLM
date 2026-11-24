@@ -1070,3 +1070,50 @@ def test_first_postproc_params_carry_prompt_embeds_identity(
         assert params.prompt_embeds is None
     assert base_worker._get_params_for_first_rsp(
         SimpleNamespace(_results={1: result}), 1) == (None, None, None)
+
+
+def _prompt_embeds_worker(torch_dtype: str,
+                          keys_rows: bool = True) -> SimpleNamespace:
+    """A worker serving a hidden-size-4 model that admits prompt_embeds."""
+    model = SimpleNamespace(
+        supports_prompt_embeds=True,
+        prompt_embeds_config_unsupported_reason=lambda: None,
+        config=SimpleNamespace(hidden_size=4, torch_dtype=torch_dtype),
+    )
+    return SimpleNamespace(
+        llm_args=SimpleNamespace(
+            speculative_config=None,
+            parallel_config=SimpleNamespace(enable_attention_dp=False,
+                                            cp_size=1),
+        ),
+        engine=SimpleNamespace(model_engine=SimpleNamespace(model=model)),
+        _cache_manager_keys_rows=lambda: keys_rows,
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "dtype, value, admitted",
+    [
+        # The float16 limit, the largest bfloat16 below it, and the next value of each.
+        (torch.float32, 65504.0, True),
+        (torch.float32, 65536.0, False),
+        (torch.bfloat16, 65280.0, True),
+        (torch.bfloat16, 65536.0, False),
+    ])
+def test_prompt_embeds_float16_range(dtype: torch.dtype, value: float,
+                                     admitted: bool) -> None:
+    # A float16 model admits rows of a wider dtype up to the float16 limit.
+    from tensorrt_llm.inputs.prompt_embeds import build_prompt_embeds
+
+    _, embeds = build_prompt_embeds(
+        None, torch.tensor([[0.5, -value, 1.0, 2.0]], dtype=dtype))
+    request = GenerationRequest([1],
+                                SamplingParams(max_tokens=1),
+                                prompt_embeds=embeds)
+    worker = _prompt_embeds_worker("float16")
+    if admitted:
+        BaseWorker._check_prompt_embeds(worker, request)
+    else:
+        with pytest.raises(RequestError, match="float16 range"):
+            BaseWorker._check_prompt_embeds(worker, request)

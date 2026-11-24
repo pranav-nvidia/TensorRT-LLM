@@ -3,7 +3,6 @@
 """Decoder input preparation state."""
 
 import contextlib
-import functools
 import itertools
 import math
 import os
@@ -3296,12 +3295,13 @@ class DecoderInputPreparer:
 
         TP rank 0 uploads the rows and broadcasts them to the other TP ranks,
         which schedule the same chunks but receive requests without rows
-        (``RequestBroadcaster``).
+        (``RequestBroadcaster``). Rows are staged in the model dtype; their
+        identity stays that of the caller's rows.
         """
         src_rows = host.lists.prompt_embeds_src_rows
         num_rows = sum(hi - lo for _, lo, hi in src_rows)
         hidden_size = src_rows[0][0].hidden_size
-        dtype = functools.reduce(torch.promote_types, (pe.dtype for pe, _, _ in src_rows))
+        dtype = self._config.dtype
         pin = prefer_pinned()
         dst_host = torch.empty((num_rows,), dtype=torch.long, pin_memory=pin)
         torch.cat(host.lists.prompt_embeds_dst_rows, out=dst_host)

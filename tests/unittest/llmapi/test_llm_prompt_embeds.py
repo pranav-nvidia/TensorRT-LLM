@@ -520,6 +520,34 @@ def test_disaggregated_handoff() -> None:
                 )
 
 
+@pytest.mark.parametrize("model_dtype", [torch.float16, torch.bfloat16])
+def test_rows_staged_in_model_dtype(model_dtype: torch.dtype) -> None:
+    # Rows of every caller dtype upload in the model dtype, so a mixed batch is
+    # not promoted; float32 rows at the float16 limit stay finite.
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
+
+    limit = torch.finfo(torch.float16).max
+    caller_rows = [
+        torch.tensor([[limit, -limit, 1 / 3, 0.1]], dtype=torch.float32),
+        torch.tensor([[0.1, 0.2, 0.3, 0.4], [1.5, -2.5, 3.5, 4.5]], dtype=torch.bfloat16),
+        torch.tensor([[-0.1, 0.7, 1e-3, 2.0]], dtype=torch.float16),
+    ]
+    snapshots = [build_prompt_embeds(None, rows)[1] for rows in caller_rows]
+    host = SimpleNamespace(
+        lists=SimpleNamespace(
+            prompt_embeds_src_rows=[(pe, 0, pe.num_rows) for pe in snapshots],
+            prompt_embeds_dst_rows=[pe.positions for pe in snapshots],
+        )
+    )
+    preparer = SimpleNamespace(
+        _config=SimpleNamespace(dtype=model_dtype), mapping=SimpleNamespace(tp_size=1, tp_rank=0)
+    )
+    _, rows = DecoderInputPreparer._ship_prompt_embeds(preparer, host)
+    assert rows.dtype == model_dtype
+    assert torch.equal(rows.cpu(), torch.cat([r.to(model_dtype) for r in caller_rows]))
+    assert bool(torch.isfinite(rows).all())
+
+
 @pytest.mark.parametrize("request_type", ["context_only", "generation_only"])
 @pytest.mark.parametrize("v2", [True, False], ids=["v2", "v1"])
 def test_disaggregated_deployment_checks(request_type: str, v2: bool) -> None:

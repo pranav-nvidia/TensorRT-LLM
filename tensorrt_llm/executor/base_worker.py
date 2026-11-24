@@ -468,10 +468,11 @@ class BaseWorker(GenerationExecutor):
         model_dtype = getattr(config, "torch_dtype", None)
         if isinstance(model_dtype, str):
             model_dtype = getattr(torch, model_dtype, None)
-        # A generation-only request carries no rows to range-check.
+        # A generation-only request carries no rows to range-check. Compared in
+        # float32: the float16 limit rounds up to 65536 as a bfloat16 scalar.
         if (model_dtype == torch.float16 and prompt_embeds.embeds is not None
                 and prompt_embeds.dtype != torch.float16
-                and bool(prompt_embeds.embeds.abs().max() > torch.finfo(
+                and bool(prompt_embeds.embeds.abs().max().float() > torch.finfo(
                     torch.float16).max)):
             raise RequestError(
                 "prompt_embeds holds values outside the float16 range of "
