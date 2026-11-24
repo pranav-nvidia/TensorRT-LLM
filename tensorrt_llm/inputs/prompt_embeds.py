@@ -5,6 +5,7 @@
 The request contract is documented once, on ``TokensPrompt.prompt_embeds``.
 """
 
+import dataclasses
 import hashlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Sequence
@@ -32,19 +33,24 @@ class PromptEmbeds:
     """Owned prompt-embedding rows and the prompt positions they replace.
 
     Attributes:
-        embeds: ``[K, H]`` contiguous CPU tensor, or None in a finished
-            request's client copy (``identity_only``).
+        embeds: ``[K, H]`` contiguous CPU tensor, or None in a copy without rows
+            (``identity_only``, ``for_peer_ranks``).
         positions: ``[K]`` int64 CPU tensor of strictly increasing positions.
         hidden_size: ``H``.
+        dtype: dtype of ``embeds``.
         row_digests: ``K`` concatenated 32-byte SHA-256 digests, one per row.
         digest: Hex SHA-256 over dtype, shape, positions and row digests.
+        prefillable: Whether the prefill can run, from ``embeds`` or from the
+            rows TP rank 0 sends each chunk; False once the rows are gone.
     """
 
     embeds: torch.Tensor | None
     positions: torch.Tensor
     hidden_size: int
+    dtype: torch.dtype
     row_digests: bytes
     digest: str
+    prefillable: bool = True
 
     @property
     def num_rows(self) -> int:
@@ -66,13 +72,12 @@ class PromptEmbeds:
         return self.row_digests[row * _ROW_DIGEST_LEN : (row + 1) * _ROW_DIGEST_LEN]
 
     def identity_only(self) -> "PromptEmbeds":
-        return PromptEmbeds(
-            embeds=None,
-            positions=self.positions,
-            hidden_size=self.hidden_size,
-            row_digests=self.row_digests,
-            digest=self.digest,
-        )
+        """Return a copy without the rows, keeping positions and digests."""
+        return dataclasses.replace(self, embeds=None, prefillable=False)
+
+    def for_peer_ranks(self) -> "PromptEmbeds":
+        """Return the copy other ranks receive; TP rank 0 sends them each chunk's rows."""
+        return dataclasses.replace(self, embeds=None)
 
 
 _ROW_DIGEST_LEN = 32
@@ -194,6 +199,7 @@ def build_prompt_embeds(
         embeds=embeds,
         positions=positions.contiguous(),
         hidden_size=int(hidden_size),
+        dtype=embeds.dtype,
         row_digests=row_digests,
         digest=_digest(embeds, positions, row_digests),
     )
@@ -299,11 +305,9 @@ def remap_prompt_embeds(
         )
     positions = torch.tensor([mapping[p] for p in rows], dtype=torch.int64, device="cpu")
     embeds = prompt_embeds.embeds
-    return PromptEmbeds(
-        embeds=embeds,
+    return dataclasses.replace(
+        prompt_embeds,
         positions=positions,
-        hidden_size=prompt_embeds.hidden_size,
-        row_digests=prompt_embeds.row_digests,
         digest=_digest(embeds, positions, prompt_embeds.row_digests),
     )
 

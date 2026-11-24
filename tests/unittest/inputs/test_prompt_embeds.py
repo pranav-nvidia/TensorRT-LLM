@@ -136,12 +136,16 @@ def test_chunk_rows_cover_every_position_once(chunk: int) -> None:
     assert [p for p in range(10) if pe.covers(p)] == [1, 2, 4, 7, 8, 9]
 
 
-def test_identity_only() -> None:
-    _, pe = build_prompt_embeds([1, 2], _rows(2, torch.float32))
-    ident = pe.identity_only()
-    assert ident.embeds is None
-    assert (ident.digest, ident.row_digests) == (pe.digest, pe.row_digests)
-    assert torch.equal(ident.positions, pe.positions)
+def test_copies_without_rows() -> None:
+    _, pe = build_prompt_embeds([1, 2], _rows(2, torch.float16))
+    ident, peer = pe.identity_only(), pe.for_peer_ranks()
+    for copy in (ident, peer):
+        assert copy.embeds is None
+        assert (copy.digest, copy.row_digests) == (pe.digest, pe.row_digests)
+        assert (copy.dtype, copy.hidden_size) == (torch.float16, pe.hidden_size)
+        assert torch.equal(copy.positions, pe.positions)
+    # Peer ranks still run the prefill; a disaggregated generation request cannot.
+    assert (pe.prefillable, peer.prefillable, ident.prefillable) == (True, True, False)
 
 
 def test_block_keys_cover_row_and_placeholder_only() -> None:

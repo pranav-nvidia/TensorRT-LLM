@@ -22,7 +22,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionRuntimeFeatures,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
-from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.distributed import Distributed, allgather
 from tensorrt_llm._torch.host_staging import HostUploader
 from tensorrt_llm._torch.kernels.spec_step_copies import op as spec_step_copies
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -75,6 +75,7 @@ from tensorrt_llm.inputs.multimodal import (
     check_mm_embed_cumsum_if_needed,
     strip_mm_data_for_generation,
 )
+from tensorrt_llm.inputs.prompt_embeds import PromptEmbeds
 from tensorrt_llm.llmapi.llm_args import (
     DecodingBaseConfig,
     DSparkDecodingConfig,
@@ -319,9 +320,10 @@ class HostLists:
     # draft_probs rows are one-hot'd after spec_metadata.prepare().
     padding_gen_slots: list[int] = field(default_factory=list)
     multimodal_params_list: list[MultimodalParams] = field(default_factory=list)
-    # Per context request with embedding rows in its chunk: input rows, CPU rows.
+    # Per context request with embedding rows in its chunk: input rows, and the
+    # snapshot with its [lo, hi) row range.
     prompt_embeds_dst_rows: list[torch.Tensor] = field(default_factory=list)
-    prompt_embeds_src_rows: list[torch.Tensor] = field(default_factory=list)
+    prompt_embeds_src_rows: list[tuple[PromptEmbeds, int, int]] = field(default_factory=list)
     # (start_idx, end_idx, (3,1,L) mrope_pos_ids) per multimodal request
     mrope_position_ids: list[tuple[int, int, torch.Tensor]] = field(default_factory=list)
     mrope_delta_write_seq_slots: list[int] = field(default_factory=list)
@@ -1561,7 +1563,8 @@ class DecoderInputPreparer:
         """Record the prompt-embedding rows that fall in this chunk.
 
         Staged per chunk from the request's CPU copy, so recomputed or replayed
-        prefills (including CED replay rows) read them again.
+        prefills (including CED replay rows) read them again. Only TP rank 0
+        holds the rows; every rank records the same ranges.
         """
         prompt_embeds = request.py_prompt_embeds
         lo, hi = prompt_embeds.chunk_rows(begin, begin + num_tokens)
@@ -1569,7 +1572,7 @@ class DecoderInputPreparer:
             return
         positions = prompt_embeds.positions[lo:hi]
         host.lists.prompt_embeds_dst_rows.append(positions + (context_start_idx - begin))
-        host.lists.prompt_embeds_src_rows.append(prompt_embeds.embeds[lo:hi])
+        host.lists.prompt_embeds_src_rows.append((prompt_embeds, lo, hi))
 
     def _pack_context_multimodal(
         self,
@@ -3288,22 +3291,35 @@ class DecoderInputPreparer:
             )
         return inputs
 
-    @staticmethod
-    def _ship_prompt_embeds(host: HostInputs) -> tuple[torch.Tensor, torch.Tensor]:
-        """Copy this pass's prompt-embedding rows and their input rows to the GPU."""
-        dst_rows = host.lists.prompt_embeds_dst_rows
+    def _ship_prompt_embeds(self, host: HostInputs) -> tuple[torch.Tensor, torch.Tensor]:
+        """Copy this pass's prompt-embedding rows and their input rows to the GPU.
+
+        TP rank 0 uploads the rows and broadcasts them to the other TP ranks,
+        which schedule the same chunks but receive requests without rows
+        (``RequestBroadcaster``).
+        """
         src_rows = host.lists.prompt_embeds_src_rows
-        num_rows = sum(rows.shape[0] for rows in src_rows)
-        dtype = functools.reduce(torch.promote_types, (rows.dtype for rows in src_rows))
+        num_rows = sum(hi - lo for _, lo, hi in src_rows)
+        hidden_size = src_rows[0][0].hidden_size
+        dtype = functools.reduce(torch.promote_types, (pe.dtype for pe, _, _ in src_rows))
         pin = prefer_pinned()
-        rows_host = torch.empty((num_rows, src_rows[0].shape[1]), dtype=dtype, pin_memory=pin)
-        torch.cat(src_rows, out=rows_host)
         dst_host = torch.empty((num_rows,), dtype=torch.long, pin_memory=pin)
-        torch.cat(dst_rows, out=dst_host)
+        torch.cat(host.lists.prompt_embeds_dst_rows, out=dst_host)
         dst_cuda = torch.empty_like(dst_host, device="cuda")
-        rows_cuda = torch.empty_like(rows_host, device="cuda")
         device_copy.copy(CopySite.PROMPT_EMBEDS_DST_ROWS, dst_cuda, dst_host)
-        device_copy.copy(CopySite.PROMPT_EMBEDS_ROWS, rows_cuda, rows_host)
+        tp_size, tp_rank = self.mapping.tp_size, self.mapping.tp_rank
+        if tp_rank == 0:
+            rows_host = torch.empty((num_rows, hidden_size), dtype=dtype, pin_memory=pin)
+            torch.cat([pe.embeds[lo:hi] for pe, lo, hi in src_rows], out=rows_host)
+            rows_cuda = torch.empty_like(rows_host, device="cuda")
+            device_copy.copy(CopySite.PROMPT_EMBEDS_ROWS, rows_cuda, rows_host)
+        else:
+            rows_cuda = torch.empty((0, hidden_size), dtype=dtype, device="cuda")
+        if tp_size > 1:
+            # A variable-size all-gather with only rank 0 contributing is one NCCL broadcast.
+            rows_cuda = allgather(
+                rows_cuda, self.mapping, dim=0, sizes=[num_rows] + [0] * (tp_size - 1)
+            )
         return dst_cuda, rows_cuda
 
     def _record_iter_states(self, host: HostInputs, scheduled_requests: ScheduledRequests) -> None:

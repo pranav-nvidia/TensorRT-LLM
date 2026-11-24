@@ -11,8 +11,10 @@ import json
 import os
 import pickle
 import uuid
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Iterator, List, Optional
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -336,35 +338,98 @@ def test_chunked_prefill(
         assert _run(chunked, requests) == expected
 
 
+@pytest.mark.parametrize("broadcast_kind", ["single_round", "tensor_parallel", "pipeline_parallel"])
+def test_request_broadcast_leaves_rows_on_rank0(broadcast_kind: str) -> None:
+    # Other ranks get the identity; first-stage TP ranks receive each chunk's
+    # rows from TP rank 0 when it runs.
+    from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
+    from tensorrt_llm._torch.pyexecutor.request_inputs import ExecutorRequest
+    from tensorrt_llm._torch.pyexecutor.request_utils import RequestBroadcaster
+    from tensorrt_llm.bindings import executor as bindings
+
+    _, prompt_embeds = build_prompt_embeds([1, 2, 3], torch.ones(3, 4))
+    request = ExecutorRequest.adapt(bindings.Request(input_token_ids=[1, 2, 3], max_tokens=4))
+    request.inputs.prompt_embeds = prompt_embeds
+    generation_only = ExecutorRequest.adapt(bindings.Request(input_token_ids=[1, 2], max_tokens=4))
+    generation_only.inputs.prompt_embeds = prompt_embeds.identity_only()
+    # A cancellation carries no request.
+    items = [
+        RequestQueueItem(1, request),
+        RequestQueueItem(2, generation_only),
+        RequestQueueItem(3, is_canceled_request=True),
+    ]
+    transport = MagicMock(world_size=2, rank=0, has_pp=broadcast_kind == "pipeline_parallel")
+    transport.supports_single_round_broadcast = broadcast_kind == "single_round"
+    transport.is_first_pp_rank, transport.is_last_pp_rank = True, False
+    transport.pp_size = 2
+    transport.tp_cp_broadcast.side_effect = lambda value, root: value
+    broadcaster = RequestBroadcaster(transport, SimpleNamespace(pause=nullcontext))
+    with patch.dict("os.environ", {"TRTLLM_PP_REQ_SEND_ASYNC": "0"}):
+        assert broadcaster.broadcast(items, known_nonempty=True) is items
+        if broadcast_kind == "single_round":
+            assert broadcaster.broadcast(items) is items
+    sent_calls = {
+        "single_round": transport.broadcast_or_none,
+        "tensor_parallel": transport.broadcast,
+        "pipeline_parallel": transport.tp_cp_broadcast,
+    }[broadcast_kind].call_args_list
+    if broadcast_kind == "pipeline_parallel":
+        sent_calls += transport.send_object.call_args_list
+    assert sent_calls
+    for call in sent_calls:
+        sent, sent_generation_only, cancel = pickle.loads(pickle.dumps(call.args[0]))
+        peer = sent.request.inputs.prompt_embeds
+        assert peer.embeds is None and peer.prefillable
+        assert peer.digest == prompt_embeds.digest
+        assert not sent_generation_only.request.inputs.prompt_embeds.prefillable
+        assert cancel.request is None and cancel.is_canceled_request
+    assert request.inputs.prompt_embeds is prompt_embeds
+
+
 @pytest.mark.gpu2
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
 @pytest.mark.parametrize("tp_size, pp_size", [(2, 1), (1, 2)], ids=["tp2", "pp2"])
 def test_multi_gpu(model_dir: str, table: torch.Tensor, tp_size: int, pp_size: int) -> None:
+    # Chunked prefill sends rows to the other TP rank in several passes.
     with LLM(
         model=model_dir,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.3, enable_block_reuse=True),
         tensor_parallel_size=tp_size,
         pipeline_parallel_size=pp_size,
+        enable_chunked_prefill=True,
+        max_num_tokens=64,
         max_batch_size=4,
     ) as parallel:
-        ids = _token_ids(parallel, PROMPTS)
+        ids = _token_ids(parallel, PROMPTS + [LONG_PROMPT])
+        assert len(ids[3]) > 2 * 64
         expected = _run(parallel, ids)
-        n = len(ids[0])
-        mask = [p % 2 == 1 for p in range(n)]
         requests = [
-            _placeholder_request(ids[0], mask, table),
+            _placeholder_request(ids[0], [p % 2 == 1 for p in range(len(ids[0]))], table),
             {"prompt_embeds": table[torch.tensor(ids[1])]},
             ids[2],
+            _placeholder_request(ids[3], [(p // 7) % 2 == 1 for p in range(len(ids[3]))], table),
         ]
         assert _run(parallel, requests) == expected
 
 
 def test_preemption_with_graphs_and_compile(model_dir: str, table: torch.Tensor) -> None:
+    _check_preemption(model_dir, table, tp_size=1)
+
+
+@pytest.mark.gpu2
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
+def test_preemption_multi_gpu(model_dir: str, table: torch.Tensor) -> None:
+    # Every TP rank must preempt the same requests, though only rank 0 holds the rows.
+    _check_preemption(model_dir, table, tp_size=2)
+
+
+def _check_preemption(model_dir: str, table: torch.Tensor, tp_size: int) -> None:
     # A small KV pool under MAX_UTILIZATION suspends running requests; their
     # context, embedding rows included, must come back intact. CUDA graphs and
     # torch.compile stay on for passes without embedding rows.
     with LLM(
         model=model_dir,
+        tensor_parallel_size=tp_size,
         kv_cache_config=KvCacheConfig(max_tokens=640, enable_block_reuse=False),
         scheduler_config=SchedulerConfig(
             capacity_scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION
@@ -459,11 +524,12 @@ def test_disaggregated_handoff() -> None:
 @pytest.mark.parametrize("v2", [True, False], ids=["v2", "v1"])
 def test_disaggregated_deployment_checks(request_type: str, v2: bool) -> None:
     # Both roles pass the full checks; the V1 transceiver cannot key blocks by rows.
+    # The generation role holds only the identity of float32 rows for a float16 model.
     _, pe = build_prompt_embeds([1, 2, 3], torch.ones(3, 4))
     request = GenerationRequest(
         [1, 2, 3],
         SamplingParams(max_tokens=1),
-        prompt_embeds=pe,
+        prompt_embeds=pe.identity_only() if request_type == "generation_only" else pe,
         disaggregated_params=DisaggregatedParams(request_type=request_type),
     )
     model = SimpleNamespace(
