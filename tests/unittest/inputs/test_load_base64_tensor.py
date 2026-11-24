@@ -402,6 +402,34 @@ def test_out_of_range_view_values_rejected(offset: int, size: tuple, stride: tup
         load_base64_tensor(payload, max_bytes=_LIMIT)
 
 
+def test_zero_sized_view_with_huge_dims_rejected() -> None:
+    """Dims that each fit but multiply past the limit are refused despite a zero dim."""
+    size = (1_000_000,) * 4 + (0,)
+    payload = _replace_pickle(_encode(torch.zeros(4)), _view_pickle(0, size, (1,) * 5, 4))
+    with pytest.raises(ValueError, match="multiply"):
+        load_base64_tensor(payload, max_bytes=_LIMIT)
+
+
+def test_base64_decoded_in_slices(monkeypatch) -> None:
+    """Each base64 call sees a bounded slice, so a worker thread yields the GIL between them."""
+    lengths = []
+    a2b_base64 = utils.binascii.a2b_base64
+
+    def spy(text: str, **kwargs: bool) -> bytes:
+        """Record the slice length and decode as ``binascii.a2b_base64`` does."""
+        lengths.append(len(text))
+        return a2b_base64(text, **kwargs)
+
+    monkeypatch.setattr(utils, "_BASE64_SLICE_CHARS", 64)
+    monkeypatch.setattr(utils.binascii, "a2b_base64", spy)
+    tensor = torch.randn(100)
+    payload = _encode(tensor)
+    wrapped = "\n".join(payload[i : i + 76] for i in range(0, len(payload), 76))
+    for text in (payload, wrapped):
+        assert torch.equal(load_base64_tensor(text, max_bytes=_LIMIT), tensor)
+    assert len(lengths) > 2 * len(payload) // 64 and max(lengths) <= 64
+
+
 def _patch_storage_record(payload: str, data: bytes, size: int, crc: int) -> str:
     """Overwrite the data/0 record's bytes and its declared stored size and CRC."""
     raw = bytearray(base64.b64decode(payload))
