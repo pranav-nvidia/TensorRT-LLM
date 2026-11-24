@@ -2,12 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Real forwards of tiny models whose layers read token ids after the embedding.
 
-A prompt-embedding row goes through the same overlay as in the engine
-(``embed_prompt_tokens`` + ``prompt_embeds_model_inputs``); plain requests in
-the same batch must be unaffected.
+A prompt-embedding row goes through the engine's overlay
+(``DecoderRunner._apply_prompt_embeds_overlay``); plain requests in the same
+batch must be unaffected.
 """
 
 from copy import deepcopy
+from types import SimpleNamespace
 from typing import Optional
 
 import test_modeling_gemma4 as gemma4_tests
@@ -15,6 +16,7 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
 
 
 def _gemma4_context_logits(
@@ -62,16 +64,15 @@ def _forward_inputs(
     embed_rows: Optional[torch.Tensor],
     ple_input_ids: Optional[torch.Tensor],
 ) -> dict[str, Optional[torch.Tensor]]:
-    """Return forward kwargs, overlaying ``embed_rows`` as the engine does."""
+    """Return forward kwargs, overlaying ``embed_rows`` through the engine's overlay."""
     if embed_rows is not None:
-        embeds = model.embed_prompt_tokens(input_ids)
         # Rows equal to the token embedding: only the side channel can differ.
-        embeds.index_copy_(0, embed_rows, model.model.embed_tokens(input_ids[embed_rows]))
-        return {
-            "input_ids": None,
-            "inputs_embeds": embeds,
-            **model.prompt_embeds_model_inputs(input_ids, embed_rows),
-        }
+        return DecoderRunner._apply_prompt_embeds_overlay(
+            SimpleNamespace(_model=model),
+            {"input_ids": input_ids},
+            embed_rows,
+            model.model.embed_tokens(input_ids[embed_rows]),
+        )
     kwargs = {"input_ids": input_ids}
     if ple_input_ids is not None:
         kwargs["ple_input_ids"] = ple_input_ids

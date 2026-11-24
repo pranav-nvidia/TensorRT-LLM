@@ -26,6 +26,8 @@ from .test_llm import get_model_path
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 PROMPTS = ["The capital of France is", "Write a haiku about the ocean. The waves"]
+QWEN3_VL = "Qwen3/Qwen3-VL-2B-Instruct"
+QWEN2_5_VL = "Qwen2.5-VL-3B-Instruct"
 
 
 def _greedy() -> SamplingParams:
@@ -49,24 +51,34 @@ def _text_embedding_table(model_dir: str) -> torch.Tensor:
     raise FileNotFoundError(f"no embed_tokens.weight under {model_dir}")
 
 
-@pytest.fixture(scope="module", params=["Qwen3/Qwen3-VL-2B-Instruct", "Qwen2.5-VL-3B-Instruct"])
-def model_dir(request) -> str:
-    path = get_model_path(request.param)
+def _model_path(name: str) -> str:
+    path = get_model_path(name)
     if not os.path.isdir(path):
         pytest.skip(f"{path} not found")
     return path
 
 
-@pytest.fixture(scope="module")
-def llm(model_dir: str) -> Iterator[LLM]:
-    with LLM(
+def _engine(model_dir: str) -> LLM:
+    return LLM(
         model=model_dir,
         # Token caps keep this engine and the chunked case's second one within an A10.
         kv_cache_config=KvCacheConfig(
             free_gpu_memory_fraction=0.4, max_tokens=8192, enable_block_reuse=True
         ),
         max_batch_size=4,
-    ) as instance:
+    )
+
+
+@pytest.fixture(scope="module")
+def model_dir() -> str:
+    # The engine-side cases are model independent; test_qwen2_5_vl_image_swap covers
+    # Qwen2-VL's own fusion path.
+    return _model_path(QWEN3_VL)
+
+
+@pytest.fixture(scope="module")
+def llm(model_dir: str) -> Iterator[LLM]:
+    with _engine(model_dir) as instance:
         yield instance
 
 
@@ -137,6 +149,12 @@ def test_prompt_embeds_with_image_in_one_request(llm: LLM, model_dir: str, chunk
         )
 
 
+def test_qwen2_5_vl_image_swap() -> None:
+    model_dir = _model_path(QWEN2_5_VL)
+    with _engine(model_dir) as llm:
+        _check_image_swap(llm, model_dir, reuse=False)
+
+
 def _check_image_swap(llm: LLM, model_dir: str, reuse: bool) -> None:
     table = _text_embedding_table(model_dir)
     image = _image_request(llm, model_dir)
@@ -205,8 +223,6 @@ def test_prompt_embeds_with_video_in_one_request(
 ) -> None:
     # Qwen3-VL frames each video frame with timestamp text the mask never indexes.
     # Text first: "?" before the video merges with the first timestamp's "<".
-    if "Qwen3-VL" not in model_dir:
-        pytest.skip("timestamp-framed video layout is Qwen3-VL specific")
     table = _text_embedding_table(model_dir)
     plain = _video_request(llm, text_first)
     ids = plain["prompt_token_ids"]

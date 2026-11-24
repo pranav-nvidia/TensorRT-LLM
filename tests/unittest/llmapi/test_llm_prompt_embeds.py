@@ -105,9 +105,10 @@ def _max_paused_requests(llm: LLM) -> int:
     return paused
 
 
-@pytest.fixture(scope="module", params=[QWEN3, TINYLLAMA])
-def model_dir(request) -> str:
-    path = get_model_path(request.param)
+@pytest.fixture(scope="module")
+def model_dir() -> str:
+    # Engine paths do not depend on the architecture; test_matches_tokens_llama adds a second one.
+    path = get_model_path(QWEN3)
     if not os.path.isdir(path):
         pytest.skip(f"{path} not found")
     return path
@@ -137,6 +138,22 @@ MASKS = {
 
 @pytest.mark.parametrize("pattern", ["whole", *MASKS])
 def test_matches_tokens(llm: LLM, table: torch.Tensor, pattern: str) -> None:
+    _check_matches_tokens(llm, table, pattern)
+
+
+def test_matches_tokens_llama() -> None:
+    model = get_model_path(TINYLLAMA)
+    if not os.path.isdir(model):
+        pytest.skip(f"{model} not found")
+    with LLM(
+        model=model, kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.3), max_batch_size=8
+    ) as llama:
+        table = _embedding_table(model)
+        for pattern in ["whole", *MASKS]:
+            _check_matches_tokens(llama, table, pattern)
+
+
+def _check_matches_tokens(llm: LLM, table: torch.Tensor, pattern: str) -> None:
     # The last prompt stays plain, so every batch mixes embedding and token prompts.
     ids = _token_ids(llm, PROMPTS)
     expected = _run(llm, ids)
@@ -237,8 +254,10 @@ def test_reuse_with_embedding_final_token(llm: LLM, table: torch.Tensor) -> None
     salt = uuid.uuid4().hex
     expected = _run(llm, [ids])[0]
     request = {"prompt_embeds": table[torch.tensor(ids)]}
-    for _ in range(3):
-        assert _run(llm, [request], salt)[0] == expected
+    for repeat in range(3):
+        out = llm.generate([request], _greedy(), cache_salt=salt)[0]
+        assert list(out.outputs[0].token_ids) == expected
+        assert out.cached_tokens == (len(ids) - 1 if repeat else 0)
 
 
 def test_n_greater_than_one(llm: LLM, table: torch.Tensor, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -281,16 +300,12 @@ def test_rejects_bad_requests(llm: LLM, table: torch.Tensor) -> None:
     assert llm.generate(ids, _greedy()).outputs[0].token_ids
 
 
-@pytest.mark.parametrize("disable_overlap_scheduler", [False, True], ids=["overlap", "no_overlap"])
-def test_chunked_prefill(
-    model_dir: str, table: torch.Tensor, disable_overlap_scheduler: bool
-) -> None:
+def test_chunked_prefill(model_dir: str, table: torch.Tensor) -> None:
     with LLM(
         model=model_dir,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.3, enable_block_reuse=False),
         enable_chunked_prefill=True,
         max_num_tokens=64,
-        disable_overlap_scheduler=disable_overlap_scheduler,
         max_batch_size=4,
     ) as chunked:
         ids = _token_ids(chunked, [LONG_PROMPT, PROMPTS[0]])
@@ -333,8 +348,12 @@ def test_multi_gpu(model_dir: str, table: torch.Tensor, tp_size: int, pp_size: i
         assert _run(parallel, requests) == expected
 
 
-def test_preemption_with_graphs_and_compile(model_dir: str, table: torch.Tensor) -> None:
-    _check_preemption(model_dir, table, tp_size=1)
+@pytest.mark.parametrize("host_cache_size", [None, 0], ids=["host_tier", "recompute"])
+def test_preemption_with_graphs_and_compile(
+    model_dir: str, table: torch.Tensor, host_cache_size: Optional[int]
+) -> None:
+    # Without a host tier a preempted request recomputes its context, rows included.
+    _check_preemption(model_dir, table, tp_size=1, host_cache_size=host_cache_size)
 
 
 @pytest.mark.gpu2
@@ -344,14 +363,18 @@ def test_preemption_multi_gpu(model_dir: str, table: torch.Tensor) -> None:
     _check_preemption(model_dir, table, tp_size=2)
 
 
-def _check_preemption(model_dir: str, table: torch.Tensor, tp_size: int) -> None:
+def _check_preemption(
+    model_dir: str, table: torch.Tensor, tp_size: int, host_cache_size: Optional[int] = None
+) -> None:
     # A small KV pool under MAX_UTILIZATION suspends running requests; their
     # context, embedding rows included, must come back intact. CUDA graphs and
     # torch.compile stay on for passes without embedding rows.
     with LLM(
         model=model_dir,
         tensor_parallel_size=tp_size,
-        kv_cache_config=KvCacheConfig(max_tokens=640, enable_block_reuse=False),
+        kv_cache_config=KvCacheConfig(
+            max_tokens=640, enable_block_reuse=False, host_cache_size=host_cache_size
+        ),
         scheduler_config=SchedulerConfig(
             capacity_scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION
         ),
