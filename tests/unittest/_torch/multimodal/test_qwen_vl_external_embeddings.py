@@ -10,9 +10,11 @@ import torch
 
 from tensorrt_llm._torch.models.modeling_qwen2vl import (
     Qwen2_5VLInputProcessorBase,
-    cap_mrope_decode_tokens,
+    Qwen2VLModelBase,
 )
 from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLInputProcessorBase
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.inputs.external_embeddings import ExternalEmbeddingItem
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm import BaseLLM
@@ -267,17 +269,24 @@ def test_qwen2_5_video_positions_past_rotary_table_are_rejected(timing, match):
         _attach_framed_video(processor, _video(8, 2, 2, **timing))
 
 
-def _admitted(mrope_config: dict, prompt_len: int, max_new_tokens: int) -> SimpleNamespace:
-    """A request as admission sees it, after cap_mrope_decode_tokens."""
-    request = SimpleNamespace(
-        py_multimodal_data={"mrope_config": mrope_config},
-        orig_prompt_len=prompt_len,
+def _admitted(
+    mrope_config: dict, prompt_len: int, max_new_tokens: int, draft_tokens: int = 0
+) -> LlmRequest:
+    """A request after the Qwen-VL model's admission hook."""
+    request = LlmRequest(
+        request_id=1,
         max_new_tokens=max_new_tokens,
-        py_max_new_tokens=max_new_tokens,
+        input_tokens=[0] * prompt_len,
+        sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
+        is_streaming=False,
+        py_multimodal_data={"mrope_config": mrope_config},
     )
-    cap_mrope_decode_tokens(
-        request, _make_processor(Qwen2_5VLInputProcessorBase).config.text_config
+    pretrained_config = _make_processor(Qwen2_5VLInputProcessorBase).config
+    spec_config = SimpleNamespace(max_total_draft_tokens=draft_tokens) if draft_tokens else None
+    model = SimpleNamespace(
+        model_config=SimpleNamespace(pretrained_config=pretrained_config, spec_config=spec_config)
     )
+    Qwen2VLModelBase.validate_request(model, request)
     return request
 
 
@@ -289,10 +298,11 @@ def test_qwen2_5_video_decoding_is_capped_at_admission():
     capped = _admitted(mrope_config, len(tokens), 128000 - len(tokens))
     assert capped.max_new_tokens == capped.py_max_new_tokens == 23
     assert _admitted(mrope_config, len(tokens), 5).py_max_new_tokens == 5
+    # A speculative step forwards its draft tokens past the last accepted one.
+    assert _admitted(mrope_config, len(tokens), 100, draft_tokens=3).max_new_tokens == 20
     # Positions that trail the token count leave max_seq_len as the only limit.
-    assert _admitted(
-        {"mrope_position_deltas": torch.tensor([[-50]])}, 10, 10**6
-    ).max_new_tokens == (10**6)
+    trailing = {"mrope_position_deltas": torch.tensor([[-50]], dtype=torch.int32)}
+    assert _admitted(trailing, 10, 10**6).max_new_tokens == 10**6
     with pytest.raises(ValueError, match="start past"):
         _admitted({"mrope_position_deltas": torch.tensor([[127990]])}, 10, 1)
 

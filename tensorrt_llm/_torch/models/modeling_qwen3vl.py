@@ -1735,6 +1735,7 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
 
     def validate_request(self, request: Any) -> None:
         """Cap decoding so mRoPE positions stay in the rotary table."""
+        spec_config = getattr(self.model_config, "spec_config", None)
         cap_mrope_decode_tokens(
             request,
             getattr(
@@ -1742,6 +1743,7 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
                 "text_config",
                 self.model_config.pretrained_config,
             ),
+            lookahead=getattr(spec_config, "max_total_draft_tokens", None) or 0,
         )
 
     def __init__(

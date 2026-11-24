@@ -2494,13 +2494,17 @@ def _qwen_vision_input_partitions(
     }
 
 
-def cap_mrope_decode_tokens(request: Any, text_config: Any) -> None:
+def cap_mrope_decode_tokens(request: Any,
+                            text_config: Any,
+                            lookahead: int = 0) -> None:
     """Cap a request's new tokens so its decode positions fit the rotary table.
 
     A positive mRoPE delta puts decode positions ahead of the token count,
     which max_seq_len bounds, so a request may run past the
     max_position_embeddings rotary table. The executor runs this at
-    admission, after max_new_tokens is clamped to max_seq_len.
+    admission, after max_new_tokens is clamped to max_seq_len. ``lookahead``
+    reserves the draft tokens a speculative step forwards past the last
+    accepted token.
     """
     max_positions = getattr(text_config, "max_position_embeddings", None)
     mrope_config = (request.py_multimodal_data or {}).get("mrope_config") or {}
@@ -2511,7 +2515,7 @@ def cap_mrope_decode_tokens(request: Any, text_config: Any) -> None:
     delta = int(deltas.max())
     if delta <= 0:
         return
-    budget = max_positions - request.orig_prompt_len - delta
+    budget = max_positions - request.orig_prompt_len - delta - lookahead
     if budget <= 0:
         raise ValueError(
             f"Qwen mRoPE decode positions start past the model's "
@@ -2540,10 +2544,12 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
 
     def validate_request(self, request: Any) -> None:
         """Cap decoding so mRoPE positions stay in the rotary table."""
+        spec_config = getattr(self.model_config, "spec_config", None)
         cap_mrope_decode_tokens(
             request,
             getattr(self.model_config.pretrained_config, "text_config",
-                    self.model_config.pretrained_config))
+                    self.model_config.pretrained_config),
+            lookahead=getattr(spec_config, "max_total_draft_tokens", None) or 0)
 
     def __init__(
         self,
