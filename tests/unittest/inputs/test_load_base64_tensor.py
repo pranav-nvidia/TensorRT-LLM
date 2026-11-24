@@ -56,8 +56,13 @@ def test_async_round_trip() -> None:
     assert torch.equal(decoded, tensor)
 
 
-def test_encoded_length_checked_before_decode() -> None:
+def test_encoded_length_checked_before_decode(monkeypatch) -> None:
     """An over-long string is rejected without decoding it."""
+
+    def no_decode(*args, **kwargs) -> bytes:
+        raise AssertionError("an over-long payload was decoded")
+
+    monkeypatch.setattr(utils, "_b64decode_strict", no_decode)
     with pytest.raises(ValueError, match="base64 characters"):
         load_base64_tensor("A" * 5000, max_bytes=1024)
 
