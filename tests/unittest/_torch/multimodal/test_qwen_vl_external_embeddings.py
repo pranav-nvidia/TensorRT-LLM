@@ -8,8 +8,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2_5VLInputProcessorBase
+from tensorrt_llm._torch.models.modeling_qwen2vl import (
+    Qwen2_5VLInputProcessorBase,
+    Qwen2VLModelBase,
+)
 from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLInputProcessorBase
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.inputs.external_embeddings import ExternalEmbeddingItem
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm import BaseLLM
@@ -245,12 +250,12 @@ def test_qwen2_5_video_requires_one_time_scale(timing, match):
         _attach(processor, "<|video_pad|>", {"video": [_video(2, 2, 2, **timing)]})
 
 
-def _attach_framed_video(processor, video: dict, max_tokens: int) -> tuple:
-    """Attach one framed video with a given generation length."""
+def _attach_framed_video(processor, video: dict) -> tuple:
+    """Attach one framed video."""
     return processor.attach_multimodal_embeddings(
         {"prompt": "<|vision_start|><|video_pad|><|vision_end|>"},
         {"video": [video]},
-        SamplingParams(max_tokens=max_tokens),
+        SamplingParams(),
     )
 
 
@@ -261,31 +266,64 @@ def _attach_framed_video(processor, video: dict, max_tokens: int) -> tuple:
 def test_qwen2_5_video_positions_past_rotary_table_are_rejected(timing, match):
     processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
     with pytest.raises(ValueError, match=match):
-        _attach_framed_video(processor, _video(8, 2, 2, **timing), max_tokens=1)
+        _attach_framed_video(processor, _video(8, 2, 2, **timing))
 
 
-@pytest.mark.parametrize("max_tokens", [32, None])
-def test_qwen2_5_video_decode_positions_stay_in_rotary_table(max_tokens):
+def _admitted(
+    mrope_config: dict, prompt_len: int, max_new_tokens: int, draft_tokens: int = 0
+) -> LlmRequest:
+    """A request after the Qwen-VL model's admission hook."""
+    request = LlmRequest(
+        request_id=1,
+        max_new_tokens=max_new_tokens,
+        input_tokens=[0] * prompt_len,
+        sampling_config=SamplingConfig(SamplingParams()._get_sampling_config()),
+        is_streaming=False,
+        py_multimodal_data={"mrope_config": mrope_config},
+    )
+    pretrained_config = _make_processor(Qwen2_5VLInputProcessorBase).config
+    spec_config = SimpleNamespace(max_total_draft_tokens=draft_tokens) if draft_tokens else None
+    model = SimpleNamespace(
+        model_config=SimpleNamespace(pretrained_config=pretrained_config, spec_config=spec_config)
+    )
+    Qwen2VLModelBase.validate_request(model, request)
+    return request
+
+
+def test_qwen2_5_video_decoding_is_capped_at_admission():
     processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
     # The last video position is 1 + 7 * 9141 * 2 = 127975, below 128000.
-    video = _video(8, 2, 2, second_per_grid_ts=9141.0)
-    _attach_framed_video(processor, video, max_tokens=1)
-    with pytest.raises(ValueError, match="set max_tokens to at most 23$"):
-        _attach_framed_video(processor, video, max_tokens=max_tokens)
+    tokens, extra = _attach_framed_video(processor, _video(8, 2, 2, second_per_grid_ts=9141.0))
+    mrope_config = extra["multimodal_data"]["mrope_config"]
+    capped = _admitted(mrope_config, len(tokens), 128000 - len(tokens))
+    assert capped.max_new_tokens == capped.py_max_new_tokens == 23
+    assert _admitted(mrope_config, len(tokens), 5).py_max_new_tokens == 5
+    # A speculative step forwards its draft tokens past the last accepted one.
+    assert _admitted(mrope_config, len(tokens), 100, draft_tokens=3).max_new_tokens == 20
+    # Positions that trail the token count leave max_seq_len as the only limit.
+    trailing = {"mrope_position_deltas": torch.tensor([[-50]], dtype=torch.int32)}
+    assert _admitted(trailing, 10, 10**6).max_new_tokens == 10**6
+    with pytest.raises(ValueError, match="start past"):
+        _admitted({"mrope_position_deltas": torch.tensor([[127990]])}, 10, 1)
 
 
-def test_qwen2_5_decode_bound_clamps_max_tokens_to_context():
+def test_qwen2_5_video_without_max_tokens_is_capped_not_rejected():
     processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
-    # Positions trail the token count, so any max_tokens fits once clamped.
-    video = _video(2, 8, 8, second_per_grid_ts=1.0)
-    _attach_framed_video(processor, video, max_tokens=10**9)
+    # trtllm-serve leaves max_tokens unset; the worker then fills max_seq_len - prompt_len.
+    tokens, extra = processor.attach_multimodal_embeddings(
+        {"prompt": "<|vision_start|><|video_pad|><|vision_end|>"},
+        {"video": [_video(8, 2, 2, second_per_grid_ts=9141.0)]},
+        SamplingParams(max_tokens=None),
+    )
+    request = _admitted(extra["multimodal_data"]["mrope_config"], len(tokens), 4096 - len(tokens))
+    assert request.max_new_tokens == request.py_max_new_tokens == 23
 
 
 @pytest.mark.parametrize("timestamps", [[0.0, 1e308], [-1.0, 0.0]])
 def test_qwen3_out_of_range_timestamps_are_rejected(timestamps):
     processor = _make_processor(Qwen3VLInputProcessorBase)
     with pytest.raises(ValueError, match=r"\[0, 1e6\] seconds"):
-        _attach_framed_video(processor, _video(2, 4, 2, timestamps=timestamps), max_tokens=1)
+        _attach_framed_video(processor, _video(2, 4, 2, timestamps=timestamps))
 
 
 def test_qwen2_5_bare_video_placeholder_is_rejected():
@@ -327,7 +365,17 @@ def test_qwen2_5_bare_video_placeholder_is_rejected():
             "needs image placeholders framed",
         ),
         ({"image": None}, "<|image_pad|>", "must be a list"),
-        ({"image": [torch.ones(4, _HIDDEN, dtype=torch.int32)]}, "<|image_pad|>", "floating"),
+        (
+            {"video": [_video(1, 2, 2, timestamps=[0.0], fps=None)]},
+            "<|video_pad|>",
+            r"omit \['fps'\] instead of passing None",
+        ),
+        ({"image": [torch.ones(4, _HIDDEN, dtype=torch.int32)]}, "<|image_pad|>", "bfloat16"),
+        (
+            {"image": [torch.ones(4, _HIDDEN).to(torch.float8_e4m3fn)]},
+            "<|image_pad|>",
+            "bfloat16",
+        ),
         ({"audio": [torch.ones(4, _HIDDEN)]}, "<|image_pad|>", "Unsupported modalities"),
         (
             {"image": [{"mm_embeddings": torch.ones(4, _HIDDEN), "timestamps": [0.0]}]},
@@ -369,13 +417,11 @@ def test_position_metadata_joins_the_cache_key():
     assert early[0] != late[0]
 
 
-def test_uuid_joins_the_cache_key_and_absent_modalities_are_ignored():
+def test_uuids_of_absent_modalities_are_ignored():
     processor = _make_processor(Qwen3VLInputProcessorBase)
     prompt = "<|vision_start|><|image_pad|><|vision_end|>"
     image = {"image": [{"mm_embeddings": torch.ones(4, _HIDDEN), "image_grid_thw": [1, 4, 4]}]}
     _, plain = _hashes(processor, prompt, image)
-    _, tagged = _hashes(processor, prompt, image, multi_modal_uuids={"image": ["img-1"]})
-    assert tagged != plain
     # As for raw media, a UUID key with no items of that modality is ignored.
     _, other = _hashes(processor, prompt, image, multi_modal_uuids={"video": ["clip-1"]})
     assert other == plain

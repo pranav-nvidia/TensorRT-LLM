@@ -1282,15 +1282,14 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             image_grid_thw: torch.LongTensor,
             video_grid_thw: torch.LongTensor,
             attention_mask: torch.Tensor,
-            second_per_grid_ts: torch.Tensor = None,
-            max_tokens: Optional[int] = None) -> Dict[str, torch.Tensor]:
+            second_per_grid_ts: torch.Tensor = None) -> Dict[str, torch.Tensor]:
         # Dispatch via ``type(self)`` so subclasses (e.g. Qwen3-VL) get their
         # overridden ``get_rope_index`` instead of the base implementation.
         mrope_position_ids, mrope_position_deltas = type(self).get_rope_index(
             self.config, input_ids, image_grid_thw, video_grid_thw,
             attention_mask, second_per_grid_ts)
         self._check_mrope_positions(mrope_position_ids, mrope_position_deltas,
-                                    input_ids.shape[-1], max_tokens)
+                                    input_ids.shape[-1])
 
         mrope_config = {}
         mrope_config['mrope_position_ids'] = mrope_position_ids.to(
@@ -1301,14 +1300,12 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
 
     def _check_mrope_positions(self, position_ids: torch.Tensor,
                                position_deltas: torch.Tensor,
-                               prompt_length: int,
-                               max_tokens: Optional[int]) -> None:
-        """Reject prompt or decode positions outside the rotary table.
+                               prompt_length: int) -> None:
+        """Reject prompts whose positions leave no room in the rotary table.
 
         A video time scale moves positions independently of the token count.
-        Decoding is bounded the way the executor bounds it: max_tokens clamped
-        to the context left, taking max_seq_len at its ceiling of
-        max_position_embeddings (resolve_max_seq_len).
+        The prompt and at least the first decode position must fit; admission
+        caps the rest of decoding (cap_mrope_decode_tokens).
         """
         text_config = getattr(self.config, "text_config", self.config)
         max_positions = getattr(text_config, "max_position_embeddings", None)
@@ -1319,18 +1316,11 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             raise ValueError(
                 f"Qwen mRoPE positions exceed the model's {max_positions} "
                 "positions; check the video time scale")
-        decode_tokens = max_positions - prompt_length
-        if max_tokens is not None:
-            decode_tokens = min(decode_tokens, max_tokens)
-        if decode_tokens <= 0 or not position_deltas.numel():
-            return
-        delta = int(position_deltas.max())
-        last_position = prompt_length + decode_tokens - 1 + delta
-        if last_position >= max_positions:
+        if position_deltas.numel() and (
+                prompt_length + int(position_deltas.max()) >= max_positions):
             raise ValueError(
-                f"Qwen mRoPE decode positions reach {last_position}, past the "
-                f"model's {max_positions} positions; set max_tokens to at most "
-                f"{max_positions - prompt_length - delta}")
+                f"Qwen mRoPE decode positions start past the model's "
+                f"{max_positions} positions; check the video time scale")
 
     # Qwen-VL prompt placeholders for one image or video item. A video is
     # framed by vision start / end; Qwen3-VL also accepts it bare.
@@ -1533,8 +1523,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             self.get_mrope_config(mrope_input_ids, image_grid_thw,
                                   video_grid_thw,
                                   torch.ones_like(mrope_input_ids),
-                                  second_per_grid_ts,
-                                  sampling_params.max_tokens),
+                                  second_per_grid_ts),
         }
         return prompt_token_ids, {"multimodal_data": multimodal_data}
 
@@ -1605,8 +1594,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             processed_inputs.get('image_grid_thw', None),
             processed_inputs.get('video_grid_thw', None),
             processed_inputs.get('attention_mask', None),
-            processed_inputs.get('second_per_grid_ts', None),
-            sampling_params.max_tokens)
+            processed_inputs.get('second_per_grid_ts', None))
         multimodal_data["mrope_config"] = mrope_config
 
         fused_input_ids = processed_inputs['input_ids'][0]
@@ -2506,6 +2494,40 @@ def _qwen_vision_input_partitions(
     }
 
 
+def cap_mrope_decode_tokens(request: Any,
+                            text_config: Any,
+                            lookahead: int = 0) -> None:
+    """Cap a request's new tokens so its decode positions fit the rotary table.
+
+    A positive mRoPE delta puts decode positions ahead of the token count,
+    which max_seq_len bounds, so a request may run past the
+    max_position_embeddings rotary table. The executor runs this at
+    admission, after max_new_tokens is clamped to max_seq_len. ``lookahead``
+    reserves the draft tokens a speculative step forwards past the last
+    accepted token.
+    """
+    max_positions = getattr(text_config, "max_position_embeddings", None)
+    mrope_config = (request.py_multimodal_data or {}).get("mrope_config") or {}
+    deltas = mrope_config.get("mrope_position_deltas")
+    if (type(max_positions) is not int or not isinstance(deltas, torch.Tensor)
+            or not deltas.numel()):
+        return
+    delta = int(deltas.max())
+    if delta <= 0:
+        return
+    budget = max_positions - request.orig_prompt_len - delta - lookahead
+    if budget <= 0:
+        raise ValueError(
+            f"Qwen mRoPE decode positions start past the model's "
+            f"{max_positions} positions; check the video time scale")
+    if request.py_max_new_tokens > budget:
+        logger.warning(
+            f"max_new_tokens ({request.py_max_new_tokens}) would take mRoPE "
+            f"positions past the model's {max_positions}; using {budget}.")
+        request.max_new_tokens = budget
+        request.py_max_new_tokens = budget
+
+
 class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
     supported_encoder_attention_backends = {
         "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"})
@@ -2519,6 +2541,15 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         modality: str,
     ) -> dict[str, MultimodalItemPartition] | None:
         return _qwen_vision_item_partitions(param, modality)
+
+    def validate_request(self, request: Any) -> None:
+        """Cap decoding so mRoPE positions stay in the rotary table."""
+        spec_config = getattr(self.model_config, "spec_config", None)
+        cap_mrope_decode_tokens(
+            request,
+            getattr(self.model_config.pretrained_config, "text_config",
+                    self.model_config.pretrained_config),
+            lookahead=getattr(spec_config, "max_total_draft_tokens", None) or 0)
 
     def __init__(
         self,

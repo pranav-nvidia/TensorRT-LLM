@@ -75,6 +75,7 @@ from .modeling_qwen2vl import (
     Qwen2VLInputProcessorBase,
     _prepare_qwen_vl_mrope_config,
     _qwen_vision_item_partitions,
+    cap_mrope_decode_tokens,
 )
 from .modeling_utils import (
     ModelConfig,
@@ -1731,6 +1732,19 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         manages expert implementations independently, so skip the check.
         """
         return None
+
+    def validate_request(self, request: Any) -> None:
+        """Cap decoding so mRoPE positions stay in the rotary table."""
+        spec_config = getattr(self.model_config, "spec_config", None)
+        cap_mrope_decode_tokens(
+            request,
+            getattr(
+                self.model_config.pretrained_config,
+                "text_config",
+                self.model_config.pretrained_config,
+            ),
+            lookahead=getattr(spec_config, "max_total_draft_tokens", None) or 0,
+        )
 
     def __init__(
         self,
