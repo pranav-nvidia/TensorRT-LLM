@@ -160,11 +160,17 @@ def test_completion_request_byte_limit(serve_env: ServeTestEnv, monkeypatch) -> 
 
 def test_completion_byte_limit_counts_whole_storage(serve_env: ServeTestEnv, monkeypatch) -> None:
     """A small view saved with a large storage is charged for all of it."""
-    monkeypatch.setenv(PROMPT_EMBEDS_MAX_BYTES_ENV, "10000")
-    view = torch.zeros(1500)[: 2 * HIDDEN].view(2, HIDDEN)  # 6000 bytes stored
+    limit = 1_000_000
+    monkeypatch.setenv(PROMPT_EMBEDS_MAX_BYTES_ENV, str(limit))
+    # 505,000 stored bytes each: two fit the encoded-length check (which allows
+    # for line breaks) but not the storage budget.
+    view = torch.zeros(126_250)[: 2 * HIDDEN].view(2, HIDDEN)
     buf = io.BytesIO()
     torch.save(view, buf)
     payload = base64.b64encode(buf.getvalue()).decode("ascii")
+    encoded_limit = 4 * ((limit + 2) // 3)
+    assert 2 * len(payload) <= encoded_limit + encoded_limit // 38 + 4
+    assert 2 * view.untyped_storage().nbytes() > limit
     server, client = _client(serve_env)
     with client:
         assert _completion(client, prompt_embeds=payload).status_code == 200
