@@ -1150,12 +1150,6 @@ class Qwen4ExpForCausalLM(SpecDecOneEngineForCausalLM[Qwen4ExpModel, PretrainedC
     # The GDN layers' Mamba metadata, whichever cache manager serves the model.
     mamba_metadata_cls = GDNMambaMetadata
 
-    def prompt_embeds_model_inputs(
-        self, input_ids: torch.Tensor, embed_rows: torch.Tensor
-    ) -> dict[str, torch.Tensor]:
-        """Per-layer n-gram embeddings read ids; embedding rows use their placeholder id."""
-        return {"orig_input_ids": input_ids}
-
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         _normalize_qwen35_exclude_modules(model_config)
         _normalize_qwen35_quant_config_dict(model_config)

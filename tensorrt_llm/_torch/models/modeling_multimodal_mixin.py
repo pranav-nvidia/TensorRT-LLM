@@ -715,9 +715,15 @@ class MultimodalModelMixin:
         """Return the inner language model that receives prepared inputs."""
         raise NotImplementedError
 
-    def prompt_embeds_unsupported_reason(self) -> Optional[str]:
-        """Wrappers opt in once the ids they pass on handle prompt-embedding rows."""
-        return "its multimodal wrapper does not handle prompt_embeds yet"
+    # Wrappers opt in once ``forward`` applies ``prompt_embeds_overlay`` after
+    # multimodal fusion and the ids they pass on handle prompt-embedding rows.
+    supports_prompt_embeds: ClassVar[bool] = False
+
+    def prompt_embeds_config_unsupported_reason(self) -> Optional[str]:
+        """Refuse what the language model refuses."""
+        from .modeling_utils import prompt_embeds_unsupported_reason
+
+        return prompt_embeds_unsupported_reason(self.language_model)
 
     @property
     def runtime_hooks(self) -> RuntimeHooks:

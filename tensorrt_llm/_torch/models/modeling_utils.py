@@ -651,6 +651,19 @@ class PostInitCaller(type):
 TModel = TypeVar("TModel", bound=DecoderModel)
 
 
+def prompt_embeds_unsupported_reason(model: nn.Module) -> Optional[str]:
+    """Return why ``model`` cannot take ``prompt_embeds``, or None if it can.
+
+    A class opts in with ``supports_prompt_embeds``; ``prompt_embeds_config_unsupported_reason``
+    adds config-dependent refusals.
+    """
+    if not getattr(model, "supports_prompt_embeds", False):
+        return "its model class does not support prompt_embeds"
+    if type(model).__module__.startswith("tensorrt_llm._torch.modeling_v2."):
+        return "modeling_v2 implementations do not take engine-supplied embeddings yet"
+    return model.prompt_embeds_config_unsupported_reason()
+
+
 class DecoderModelForCausalLM(nn.Module,
                               Generic[TModel, TConfig],
                               metaclass=PostInitCaller):
@@ -664,15 +677,13 @@ class DecoderModelForCausalLM(nn.Module,
     # The model-specific TorchLlmArgs fields this model implements; the loader
     # rejects a set one that is not listed.
     model_specific_llm_args: ClassVar[frozenset[str]] = frozenset()
+    # Opt in once ``forward`` computes the same output from ``inputs_embeds`` as
+    # from ids and every layer that reads ids after the input embedding treats an
+    # embedding row like an image row (``prompt_embeds_model_inputs``).
+    supports_prompt_embeds: ClassVar[bool] = False
 
-    def prompt_embeds_unsupported_reason(self) -> Optional[str]:
-        """Return why this model cannot take ``prompt_embeds``, or None if it can.
-
-        Models that read token ids after the input embedding must treat an
-        embedding row like an image row (``prompt_embeds_model_inputs``) or refuse.
-        """
-        if type(self).__module__.startswith("tensorrt_llm._torch.modeling_v2."):
-            return "modeling_v2 implementations do not take engine-supplied embeddings yet"
+    def prompt_embeds_config_unsupported_reason(self) -> Optional[str]:
+        """Return why this opted-in model cannot take ``prompt_embeds`` in its config, or None."""
         return None
 
     def embed_prompt_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:

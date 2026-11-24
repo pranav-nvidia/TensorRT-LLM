@@ -1611,6 +1611,8 @@ class Gemma4TextModel(DecoderModel):
 
 @register_auto_model("Gemma4ForCausalLM")
 class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextConfig]):
+    supports_prompt_embeds = True
+
     build_mtp_draft_model_from_config = True
 
     def prompt_embeds_model_inputs(
@@ -1623,7 +1625,7 @@ class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextC
         ple_input_ids.index_fill_(0, embed_rows, self.config.pad_token_id)
         return {"ple_input_ids": ple_input_ids}
 
-    def prompt_embeds_unsupported_reason(self) -> Optional[str]:
+    def prompt_embeds_config_unsupported_reason(self) -> Optional[str]:
         if (
             self.model.hidden_size_per_layer_input
             and getattr(self.config, "pad_token_id", None) is None
@@ -2111,9 +2113,6 @@ class Gemma4AssistantForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4
     """Gemma4 MTP assistant that attends directly to the target model KV cache."""
 
     shares_target_kv_cache = True
-
-    def prompt_embeds_unsupported_reason(self) -> Optional[str]:
-        return "it is a draft model"
 
     def __init__(self, model_config: ModelConfig):
         assistant_config = model_config.pretrained_config

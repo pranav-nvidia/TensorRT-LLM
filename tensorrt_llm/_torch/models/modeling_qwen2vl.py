@@ -80,8 +80,8 @@ from .modeling_multimodal_utils import (
     find_input_mm_embeds, fuse_input_embeds, get_attached_multimodal_embeddings,
     get_multimodal_embeddings)
 from .modeling_utils import (ModelConfig, QuantConfig, _load_weights_impl,
-                             filter_weights, register_auto_model,
-                             register_vision_encoder)
+                             filter_weights, prompt_embeds_unsupported_reason,
+                             register_auto_model, register_vision_encoder)
 
 PAD_INDEX = -100  # NOTE: refer to https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2_5_vl/modular_qwen2_5_vl.py#L269
 
@@ -2346,9 +2346,12 @@ def _qwen_vision_input_partitions(
 
 class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
 
-    def prompt_embeds_unsupported_reason(self) -> Optional[str]:
-        """mRoPE positions of prompt-embedding rows are text positions."""
-        return self.llm.prompt_embeds_unsupported_reason()
+    # mRoPE positions of prompt-embedding rows are text positions.
+    supports_prompt_embeds = True
+
+    def prompt_embeds_config_unsupported_reason(self) -> Optional[str]:
+        """Refuse what the language model refuses."""
+        return prompt_embeds_unsupported_reason(self.llm)
 
     supported_encoder_attention_backends = {
         "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"})

@@ -1041,9 +1041,6 @@ class Eagle3DraftModel(DecoderModel):
 class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel,
                                                 PretrainedConfig]):
 
-    def prompt_embeds_unsupported_reason(self) -> Optional[str]:
-        return "it is a draft model"
-
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
@@ -1267,9 +1264,6 @@ class MistralLarge3DraftModel(DecoderModel):
 # NOTE: Class name says "Eagle" not "Eagle3" to match checkpoint naming (e.g., "Mistral-Large-3-675B-Instruct-2512-Eagle")
 @register_auto_model("MistralLarge3EagleForCausalLM")
 class MistralLarge3EagleForCausalLM(DecoderModelForCausalLM):
-
-    def prompt_embeds_unsupported_reason(self) -> Optional[str]:
-        return "it is a draft model"
 
     def __init__(
         self,

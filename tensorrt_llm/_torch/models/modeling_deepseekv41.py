@@ -3632,9 +3632,6 @@ class DeepseekV41ForCausalLM(DeepseekV4ForCausalLM):
     model_cls = DeepseekV41Model
     weight_loader_cls = DeepseekV41WeightLoader
 
-    def prompt_embeds_unsupported_reason(self) -> Optional[str]:
-        return "Engram n-gram hashing has no ids for embedding rows"
-
     def __pp_init__(self) -> None:
         super().__pp_init__()
         self.model_config.extra_attrs.pop("csa2_context_swa_layer_limit", None)

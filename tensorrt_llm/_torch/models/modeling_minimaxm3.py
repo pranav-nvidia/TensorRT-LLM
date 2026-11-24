@@ -3024,6 +3024,8 @@ def _fold_gemma_boundary_norm_weights(weights):
 class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, PretrainedConfig]):
     """Text-only M3 model."""
 
+    supports_prompt_embeds = True
+
     # Preserve M3's hand-fused eager decode and above-ceiling prefill paths,
     # including MXFP8 decode-graph backend tuning, instead of the FX fallback.
     use_fx_for_pcg_fallback = False
@@ -3196,13 +3198,13 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
     blobs under that namespace.
     """
 
+    # forward fuses images only when inputs_embeds is None.
+    supports_prompt_embeds = False
+
     # The vision encoder calls SDPA directly.
     supported_encoder_attention_backends = {"vision": frozenset()}
 
     lora_owner = DecoderLoraOwner(module_path="model")
-
-    def prompt_embeds_unsupported_reason(self) -> Optional[str]:
-        return "its forward drops image features when inputs_embeds is given"
 
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):
         # Capture the raw VL config before ``super().__init__`` swaps in

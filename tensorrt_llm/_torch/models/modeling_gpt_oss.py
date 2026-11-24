@@ -555,6 +555,7 @@ class Transformer(DecoderModel):
 
 @register_auto_model("GptOssForCausalLM")
 class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
+    supports_prompt_embeds = True
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls,

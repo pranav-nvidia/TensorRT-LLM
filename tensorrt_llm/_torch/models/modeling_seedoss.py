@@ -184,6 +184,8 @@ class SeedOssModel(DecoderModel):
 class SeedOssForCausalLM(SpecDecOneEngineForCausalLM[SeedOssModel,
                                                      SeedOssConfig]):
 
+    supports_prompt_embeds = True
+
     def __init__(
         self,
         model_config: ModelConfig[SeedOssConfig],
