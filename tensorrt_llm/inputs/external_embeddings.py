@@ -180,8 +180,6 @@ def parse_external_embeddings(
         )
     items: dict[str, list[ExternalEmbeddingItem]] = {}
     for modality, entries in multimodal_embedding.items():
-        if entries is None:
-            continue
         if isinstance(entries, (torch.Tensor, dict)):
             entries = [entries]
         if not isinstance(entries, (list, tuple)):
