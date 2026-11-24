@@ -337,6 +337,12 @@ def _read_tensor_archive(content: bytes,
                 raise ValueError(
                     f"Tensor payload expands to {total} bytes, over the "
                     f"{max_bytes}-byte limit.")
+            # Metadata records are sized before they are read.
+            pickle_size = archive.getinfo(prefix + "data.pkl").file_size
+            if pickle_size > _TENSOR_PICKLE_MAX_BYTES:
+                raise ValueError(
+                    f"Tensor payload pickle is {pickle_size} bytes; one tensor "
+                    f"needs far less than {_TENSOR_PICKLE_MAX_BYTES}.")
             spec = _check_tensor_pickle(archive.read(prefix + "data.pkl"),
                                         max_bytes)
             storage_bytes = spec.storage_numel * spec.dtype.itemsize
@@ -348,7 +354,9 @@ def _read_tensor_archive(content: bytes,
                 raise ValueError(
                     "Tensor payload storage record does not match its tensor.")
             if (prefix + "byteorder" in names
-                    and archive.read(prefix + "byteorder") != b"little"):
+                    and (archive.getinfo(prefix + "byteorder").file_size
+                         != len(b"little")
+                         or archive.read(prefix + "byteorder") != b"little")):
                 raise ValueError("Tensor payload must be little-endian.")
             # Copy in chunks into the tensor's buffer, so no second full copy
             # exists; zipfile checks the record's CRC once all of it is read.
@@ -453,7 +461,7 @@ def load_base64_tensor(data: str, *, max_bytes: int) -> torch.Tensor:
                          f"{max_bytes}-byte limit.")
     spec, storage = _read_tensor_archive(content, max_bytes)
     flat = (torch.frombuffer(storage, dtype=spec.dtype)
-            if storage else torch.empty(0, dtype=spec.dtype))
+            if storage else torch.empty(0, dtype=spec.dtype, device="cpu"))
     return flat.as_strided(spec.size, spec.stride, spec.offset)
 
 

@@ -460,6 +460,32 @@ def test_sliced_decoding_matches_whole_text(monkeypatch, tail: str) -> None:
                 utils._b64decode_strict(text + tail + "QQ==", strip_whitespace=True)
 
 
+def test_oversized_pickle_record_rejected_unread(monkeypatch) -> None:
+    """A data.pkl record over the pickle limit is refused from its size, before it is read."""
+    pickled = pickle.dumps(torch.zeros(1).tolist(), protocol=2)[:-1] + b"N" * 8192 + b"."
+    payload = _replace_pickle(_encode(torch.zeros(2)), pickled)
+    read = zipfile.ZipFile.read
+    reads = []
+
+    def spy(self: zipfile.ZipFile, name: str, *args: object) -> bytes:
+        """Record which records are read."""
+        reads.append(name)
+        return read(self, name, *args)
+
+    monkeypatch.setattr(zipfile.ZipFile, "read", spy)
+    with pytest.raises(ValueError, match="pickle is"):
+        load_base64_tensor(payload, max_bytes=_LIMIT)
+    assert not any(name.endswith("data.pkl") for name in reads)
+
+
+def test_empty_tensor_loads_on_cpu() -> None:
+    """A tensor with no storage loads on CPU even when the default device is elsewhere."""
+    payload = _encode(torch.zeros(0, 4))
+    with torch.device("meta"):
+        tensor = load_base64_tensor(payload, max_bytes=_LIMIT)
+    assert tensor.device.type == "cpu" and tensor.shape == (0, 4)
+
+
 def _patch_storage_record(payload: str, data: bytes, size: int, crc: int) -> str:
     """Overwrite the data/0 record's bytes and its declared stored size and CRC."""
     raw = bytearray(base64.b64decode(payload))
