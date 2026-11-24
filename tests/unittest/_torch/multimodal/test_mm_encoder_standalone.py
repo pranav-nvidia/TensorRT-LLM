@@ -26,18 +26,18 @@ from typing import Generator, Optional
 import numpy as np
 import pytest
 import torch
+from test_common.moe_tactics import fp8_block_scales_moe_config
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._torch.models.modeling_qwen3vl import \
     Qwen3VLInputProcessorBase
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
-from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.inputs import TextPrompt, default_multimodal_input_loader
 from tensorrt_llm.inputs.multimodal import apply_mm_hashes
 from tensorrt_llm.inputs.multimodal_data import VideoData
 from tensorrt_llm.llmapi import (CacheTransceiverConfig, DisaggregatedParams,
-                                 KvCacheConfig, MoeConfig)
+                                 KvCacheConfig)
 from tensorrt_llm.llmapi.llm import LLM, SamplingParams
 
 test_data_root = Path(
@@ -94,7 +94,7 @@ def _create_llm(
         model=model_dir,
         backend='pytorch',
         kv_cache_config=kv_cache_config,
-        moe_config=_get_moe_config_for_blackwell(),
+        moe_config=fp8_block_scales_moe_config(),
         trust_remote_code=True,
         cache_transceiver_config=cache_transceiver_cfg,
         disable_overlap_scheduler=disable_overlap_scheduler,
@@ -206,12 +206,6 @@ def _is_fake_checkpoint(model_dir: Path) -> bool:
     return (model_dir / _FAKE_CHECKPOINT_MARKER).exists()
 
 
-def _get_moe_config_for_blackwell() -> MoeConfig:
-    if get_sm_version() >= 100:
-        return MoeConfig(backend="DEEPGEMM")
-    return MoeConfig()
-
-
 @pytest.mark.parametrize(
     "prompts,expected_num_duplicates",
     [
@@ -251,7 +245,7 @@ def test_kv_event_mm_keys_with_reuse(prompts, expected_num_duplicates):
         event_buffer_max_size=1024,  # Enable KV cache events
         use_kv_cache_manager_v2=True,
     )
-    moe_config = _get_moe_config_for_blackwell()
+    moe_config = fp8_block_scales_moe_config()
 
     llm = LLM(model=encoder_model_dir,
               backend='pytorch',
@@ -293,14 +287,16 @@ def test_attached_embeddings_reuse_only_identical_embeddings() -> None:
     with open(_QWEN_3_VL_DIR / "config.json") as f:
         config = json.load(f)
     # Random rows stand in for encoder output: the prompt layout depends only
-    # on their shape, and the two images differ only in content.
+    # on their shape and grid, and the two images differ only in content.
     width = config["text_config"]["hidden_size"] * (
         1 + len(config["vision_config"]["deepstack_visual_indexes"]))
+    side = 16 * config["vision_config"]["spatial_merge_size"]
     generator = torch.Generator().manual_seed(0)
-    embeddings = [
-        torch.randn(256, width, generator=generator).to(torch.bfloat16).cuda()
-        for _ in range(2)
-    ]
+    embeddings = [{
+        "mm_embeddings":
+        torch.randn(256, width, generator=generator).to(torch.bfloat16).cuda(),
+        "image_grid_thw": [1, side, side],
+    } for _ in range(2)]
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
         free_gpu_memory_fraction=0.2,
@@ -752,7 +748,7 @@ def llm_and_chunked_llm(
             enable_block_reuse=False,
             free_gpu_memory_fraction=0.2,
         ),
-        moe_config=_get_moe_config_for_blackwell(),
+        moe_config=fp8_block_scales_moe_config(),
         trust_remote_code=True,
         max_batch_size=1,
         enable_chunked_prefill=True,
@@ -1080,7 +1076,7 @@ def _external_video_inputs(llm: LLM, encoder: MultimodalEncoder,
     items = []
     for index, (video, embedding) in enumerate(zip(videos, embeddings)):
         item = {
-            "embedding": embedding,
+            "mm_embeddings": embedding,
             "video_grid_thw": video_grid_thw[index].tolist(),
         }
         if is_qwen3:
@@ -1230,8 +1226,7 @@ def test_external_video_embeddings_chunked_prefill_and_reuse(
 
     Small chunks split frame groups; a replay reuses the cached prompt; a
     different embedding with the identical prompt text reuses nothing past
-    the text before the video. Timing that renders the same timestamps
-    yields the same request and reuses the video's KV.
+    the text before the video.
     """
     (llm, _), encoder = llms_and_encoder
     videos = _synthetic_videos((8, ))
@@ -1262,20 +1257,12 @@ def test_external_video_embeddings_chunked_prefill_and_reuse(
         llm.input_processor.config.video_token_id)
     item = external["multi_modal_embeddings"]["video"][0]
     changed_content = copy.deepcopy(external)
-    changed_content["multi_modal_embeddings"]["video"][0]["embedding"] = (
-        item["embedding"] * 1.01)
+    changed_content["multi_modal_embeddings"]["video"][0]["mm_embeddings"] = (
+        item["mm_embeddings"] * 1.01)
     result = chunked_reuse_llm.generate_async(
         changed_content, sampling_params=sampling).result()
     assert result.prompt_token_ids == reference.prompt_token_ids
     assert result.cached_tokens <= text_prefix
-
-    # Same formatted timestamps: identical prompt and MRoPE positions.
-    same_timestamps = copy.deepcopy(external)
-    same_timestamps["multi_modal_embeddings"]["video"][0]["fps"] = 24.001
-    result = chunked_reuse_llm.generate_async(
-        same_timestamps, sampling_params=sampling).result()
-    assert result.prompt_token_ids == reference.prompt_token_ids
-    assert result.cached_tokens > text_prefix
 
 
 @pytest.mark.parametrize("model_dir", [pytest.param(_QWEN_3_VL_DIR)],

@@ -404,16 +404,6 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
             raise ValueError(f"{name}: timestamps must lie in [0, 1e6] seconds")
         return {"timestamps": timestamps}
 
-    def _external_item_identity(
-        self, grid_thw: Tuple[int, int, int], video_metadata: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Metadata that shapes MRoPE positions without changing the rows.
-
-        Frame timestamps are printed into the prompt, so the prompt tokens
-        already key them; only the grid is added.
-        """
-        return {"grid_thw": list(grid_thw)}
-
     def _expand_external_video_placeholder(
         self,
         item: ExternalEmbeddingItem,

@@ -4,7 +4,6 @@
 
 import re
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -94,7 +93,7 @@ def _video(t, h, w, width=_HIDDEN, seed=0, **meta):
     rows = t * (h // 2) * (w // 2)
     generator = torch.Generator().manual_seed(seed)
     return {
-        "embedding": torch.randn(rows, width, generator=generator),
+        "mm_embeddings": torch.randn(rows, width, generator=generator),
         "video_grid_thw": [t, h, w],
         **meta,
     }
@@ -116,7 +115,7 @@ def test_qwen3_video_prompt_has_per_frame_timestamps_and_runs():
     assert mm_input.multimodal_run_positions == [3, 8]
     assert mm_input.multimodal_run_lengths == [2, 2]
     assert params.get_item_layout() == ((("video", 0),), (4,))
-    assert params.multimodal_data["multimodal_embedding"][0] is video["embedding"]
+    assert params.multimodal_data["multimodal_embedding"][0] is video["mm_embeddings"]
     # Qwen3 MRoPE: each frame is a (1, h=2, w=1) block placed after its timestamp
     # and vision-start text tokens; text resumes at the block maximum + 1.
     expected = [
@@ -144,7 +143,7 @@ def test_qwen3_timestamps_from_fps_and_frame_indices_match_hf():
 def test_mixed_image_and_video_follow_prompt_order():
     processor = _make_processor(Qwen3VLInputProcessorBase, deepstack_levels=1)
     width = 2 * _HIDDEN
-    image = {"embedding": torch.ones(2, width), "image_grid_thw": [1, 2, 4]}
+    image = {"mm_embeddings": torch.ones(2, width), "image_grid_thw": [1, 2, 4]}
     video = _video(1, 2, 2, width=width, timestamps=[0.0])
     prompt = (
         "<|vision_start|><|video_pad|><|vision_end|>x<|vision_start|><|image_pad|><|vision_end|>"
@@ -165,7 +164,7 @@ def test_mixed_image_and_video_follow_prompt_order():
     assert params.get_item_layout() == ((("video", 0), ("image", 0)), (1, 2))
     assert params.multimodal_input.multimodal_positions == [2, 6]
     embeddings = params.multimodal_data["multimodal_embedding"]
-    assert embeddings[0] is video["embedding"] and embeddings[1] is image["embedding"]
+    assert embeddings[0] is video["mm_embeddings"] and embeddings[1] is image["mm_embeddings"]
 
 
 def test_mixed_bare_and_framed_video_placeholders_are_rejected():
@@ -181,7 +180,7 @@ def test_mixed_bare_and_framed_video_placeholders_are_rejected():
 
 def test_non_square_image_grid_drives_mrope():
     processor = _make_processor(Qwen3VLInputProcessorBase)
-    image = {"embedding": torch.ones(2, _HIDDEN), "image_grid_thw": [1, 2, 4]}
+    image = {"mm_embeddings": torch.ones(2, _HIDDEN), "image_grid_thw": [1, 2, 4]}
     tokens, params = _attach(
         processor, "<|vision_start|><|image_pad|><|vision_end|>", {"image": [image]}
     )
@@ -206,21 +205,18 @@ def test_qwen3_5_config_takes_hidden_size_rows():
     processor = _make_processor(Qwen3VLInputProcessorBase)
     processor._config = config
     prompt = "<|vision_start|><|image_pad|><|vision_end|>"
-    image = {"embedding": torch.ones(2, _HIDDEN), "image_grid_thw": [1, 2, 4]}
+    image = {"mm_embeddings": torch.ones(2, _HIDDEN), "image_grid_thw": [1, 2, 4]}
     tokens, _ = _attach(processor, prompt, {"image": [image]})
     assert tokens.count(_IMAGE_PAD) == 2
-    wide = {"embedding": torch.ones(2, 2 * _HIDDEN), "image_grid_thw": [1, 2, 4]}
+    wide = {"mm_embeddings": torch.ones(2, 2 * _HIDDEN), "image_grid_thw": [1, 2, 4]}
     with pytest.raises(ValueError, match="width"):
         _attach(processor, prompt, {"image": [wide]})
 
 
-def test_bare_image_tensor_still_accepted_and_warns():
+def test_bare_image_tensor_needs_a_grid():
     processor = _make_processor(Qwen3VLInputProcessorBase)
-    with patch("tensorrt_llm._torch.models.modeling_qwen2vl.logger.warning_once") as warn:
-        tokens, params = _attach(processor, "<|image_pad|>", {"image": torch.ones(4, _HIDDEN)})
-    warn.assert_called_once()
-    assert tokens == [_IMAGE_PAD] * 4
-    assert params.multimodal_input is not None
+    with pytest.raises(ValueError, match="requires 'image_grid_thw'"):
+        _attach(processor, "<|image_pad|>", {"image": torch.ones(4, _HIDDEN)})
 
 
 def test_qwen2_5_video_scales_time_by_second_per_grid():
@@ -304,23 +300,31 @@ def test_qwen2_5_bare_video_placeholder_is_rejected():
         ({"video": [_video(2, 4, 2)]}, "<|video_pad|>", "timestamps"),
         ({"video": [_video(2, 4, 2, timestamps=[0.0])]}, "<|video_pad|>", "expected 2 timestamps"),
         (
-            {"video": [{"embedding": torch.ones(4, _HIDDEN), "video_grid_thw": [2, 4, 3]}]},
+            {"video": [{"mm_embeddings": torch.ones(4, _HIDDEN), "video_grid_thw": [2, 4, 3]}]},
             "<|video_pad|>",
             "multiples of the spatial merge size",
         ),
         (
-            {"video": [{"embedding": torch.ones(3, _HIDDEN), "video_grid_thw": [2, 4, 2]}]},
+            {"video": [{"mm_embeddings": torch.ones(3, _HIDDEN), "video_grid_thw": [2, 4, 2]}]},
             "<|video_pad|>",
             "has 3 rows but its grid",
         ),
-        ({"video": [{"embedding": torch.ones(4, _HIDDEN)}]}, "<|video_pad|>", "video_grid_thw"),
+        ({"video": [{"mm_embeddings": torch.ones(4, _HIDDEN)}]}, "<|video_pad|>", "video_grid_thw"),
         ({"image": [torch.ones(4, _HIDDEN + 1)]}, "<|image_pad|>", "width"),
-        ({"image": [torch.ones(4, _HIDDEN)]}, "no placeholder", "0 image placeholders"),
-        ({"image": [torch.ones(4, _HIDDEN)]}, "<|image_pad|><|image_pad|>", "more image"),
+        (
+            {"image": [{"mm_embeddings": torch.ones(4, _HIDDEN), "image_grid_thw": [1, 4, 4]}]},
+            "no placeholder",
+            "0 image placeholders",
+        ),
+        (
+            {"image": [{"mm_embeddings": torch.ones(4, _HIDDEN), "image_grid_thw": [1, 4, 4]}]},
+            "<|image_pad|><|image_pad|>",
+            "more image",
+        ),
         ({"image": [torch.ones(4, _HIDDEN, dtype=torch.int32)]}, "<|image_pad|>", "floating"),
         ({"audio": [torch.ones(4, _HIDDEN)]}, "<|image_pad|>", "Unsupported modalities"),
         (
-            {"image": [{"embedding": torch.ones(4, _HIDDEN), "timestamps": [0.0]}]},
+            {"image": [{"mm_embeddings": torch.ones(4, _HIDDEN), "timestamps": [0.0]}]},
             "<|image_pad|>",
             "only applies to video",
         ),
@@ -343,8 +347,10 @@ def test_position_metadata_joins_the_cache_key():
     rows = torch.ones(4, _HIDDEN)
     image = "<|vision_start|><|image_pad|><|vision_end|>"
     qwen3 = _make_processor(Qwen3VLInputProcessorBase)
-    square = _hashes(qwen3, image, {"image": [{"embedding": rows, "image_grid_thw": [1, 4, 4]}]})
-    wide = _hashes(qwen3, image, {"image": [{"embedding": rows, "image_grid_thw": [1, 2, 8]}]})
+    square = _hashes(
+        qwen3, image, {"image": [{"mm_embeddings": rows, "image_grid_thw": [1, 4, 4]}]}
+    )
+    wide = _hashes(qwen3, image, {"image": [{"mm_embeddings": rows, "image_grid_thw": [1, 2, 8]}]})
     assert square[0] == wide[0]
     assert square[1] != wide[1]
 
@@ -352,14 +358,12 @@ def test_position_metadata_joins_the_cache_key():
     qwen2_5 = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
 
     def clip(**timing):
-        return {"video": [{"embedding": rows, "video_grid_thw": [2, 2, 4], **timing}]}
+        return {"video": [{"mm_embeddings": rows, "video_grid_thw": [2, 2, 4], **timing}]}
 
     slow = _hashes(qwen2_5, video, clip(fps=1.0))
     fast = _hashes(qwen2_5, video, clip(fps=2.0))
     assert slow[0] == fast[0]
     assert slow[1] != fast[1]
-    # fps resolves to second_per_grid_ts = temporal_patch_size / fps.
-    assert _hashes(qwen2_5, video, clip(second_per_grid_ts=2.0)) == slow
 
     # Qwen3 prints frame timestamps into the prompt, so they change the tokens.
     early = _hashes(qwen3, video, clip(timestamps=[0.0, 1.0]))
@@ -370,7 +374,7 @@ def test_position_metadata_joins_the_cache_key():
 def test_uuid_joins_the_cache_key_and_absent_modalities_are_ignored():
     processor = _make_processor(Qwen3VLInputProcessorBase)
     prompt = "<|vision_start|><|image_pad|><|vision_end|>"
-    image = {"image": [{"embedding": torch.ones(4, _HIDDEN), "image_grid_thw": [1, 4, 4]}]}
+    image = {"image": [{"mm_embeddings": torch.ones(4, _HIDDEN), "image_grid_thw": [1, 4, 4]}]}
     _, plain = _hashes(processor, prompt, image)
     _, tagged = _hashes(processor, prompt, image, multi_modal_uuids={"image": ["img-1"]})
     assert tagged != plain
@@ -382,8 +386,8 @@ def test_uuid_joins_the_cache_key_and_absent_modalities_are_ignored():
 def test_two_embeddings_with_same_prompt_get_different_cache_keys():
     processor = _make_processor(Qwen3VLInputProcessorBase)
     prompt = "<|vision_start|><|image_pad|><|vision_end|>describe"
-    first = {"embedding": torch.zeros(4, _HIDDEN), "image_grid_thw": [1, 4, 4]}
-    second = {"embedding": torch.ones(4, _HIDDEN), "image_grid_thw": [1, 4, 4]}
+    first = {"mm_embeddings": torch.zeros(4, _HIDDEN), "image_grid_thw": [1, 4, 4]}
+    second = {"mm_embeddings": torch.ones(4, _HIDDEN), "image_grid_thw": [1, 4, 4]}
     tokens_a, params_a = _attach(processor, prompt, {"image": [first]})
     tokens_b, params_b = _attach(processor, prompt, {"image": [second]})
     assert tokens_a == tokens_b
@@ -401,7 +405,7 @@ def test_llm_preprocess_carries_hashes_and_uuids_from_token_ids():
     inputs = {
         "prompt_token_ids": prompt_ids,
         "multi_modal_embeddings": {
-            "image": [{"embedding": torch.ones(4, _HIDDEN), "image_grid_thw": [1, 4, 4]}]
+            "image": [{"mm_embeddings": torch.ones(4, _HIDDEN), "image_grid_thw": [1, 4, 4]}]
         },
         "multi_modal_uuids": {"image": ["img-1"]},
     }

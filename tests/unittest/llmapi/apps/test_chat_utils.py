@@ -713,6 +713,30 @@ class TestParseChatMessageContentPart:
         with pytest.raises(ValueError, match="non-empty 'data' field"):
             parse_chat_message_content_part(part, mm_tracker)
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("grid", [None, [1, 4, 6]])
+    async def test_image_embeds_part_keeps_image_grid(self, mm_tracker, grid):
+        import base64
+        import io
+
+        import torch
+
+        embeds = torch.ones(6, 4)
+        with io.BytesIO() as buf:
+            torch.save(embeds, buf)
+            image_embeds = {"data": base64.b64encode(buf.getvalue()).decode("ascii")}
+        if grid is not None:
+            image_embeds["image_grid_thw"] = grid
+        part = {"type": "image_embeds", "image_embeds": image_embeds}
+
+        item = await parse_chat_message_content_part(part, mm_tracker)["data"]
+
+        if grid is None:
+            torch.testing.assert_close(item, embeds)
+        else:
+            assert item["image_grid_thw"] == grid
+            torch.testing.assert_close(item["mm_embeddings"], embeds)
+
 
 class TestMakeMediaIo:
     """_make_media_io constructs correctly-configured MediaIO instances."""
@@ -1215,28 +1239,8 @@ class TestEmbedsParts:
         result = parse_chat_message_content_part(part, mm_tracker)
         assert result["modality"] == "video" and result["is_embedding"]
         item = await result["data"]
-        assert torch.equal(item.pop("embedding"), embedding)
+        assert torch.equal(item.pop("mm_embeddings"), embedding)
         assert item == {"video_grid_thw": [2, 4, 4], "fps": 2.0, "frames_indices": [0, 1, 2, 3]}
-
-    @pytest.mark.asyncio
-    async def test_image_embeds_grid_is_optional(self, mm_tracker):
-        import torch
-
-        embedding = torch.randn(4, 4)
-        bare = parse_chat_message_content_part(
-            {"type": "image_embeds", "image_embeds": {"data": _b64_tensor(embedding)}}, mm_tracker
-        )
-        assert torch.equal(await bare["data"], embedding)
-        gridded = parse_chat_message_content_part(
-            {
-                "type": "image_embeds",
-                "image_embeds": {"data": _b64_tensor(embedding), "image_grid_thw": [1, 4, 4]},
-            },
-            mm_tracker,
-        )
-        item = await gridded["data"]
-        assert torch.equal(item["embedding"], embedding)
-        assert item["image_grid_thw"] == [1, 4, 4]
 
     @pytest.mark.parametrize(
         ("part", "match"),
