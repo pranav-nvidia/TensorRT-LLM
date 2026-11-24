@@ -582,12 +582,13 @@ def test_prefill_cuda_graph(
     ) as graphs:
         ids = _token_ids(graphs, PROMPTS)
         mixed_requests = [ids[0], {"prompt_embeds": table[torch.tensor(ids[1])]}, ids[2]]
+        _run(graphs, ids)  # The first run after startup can round differently from later replays.
         tokens, per_run = [], []
         for requests in (ids, mixed_requests, ids):
             passes.clear()
             tokens.append(_run(graphs, requests))
             per_run.append(list(passes))
-    # The eager mixed pass may round differently from graph replay; plain replays must agree.
+    # The eager mixed pass may round differently from graph replay; plain replays around it must agree.
     assert tokens[2] == tokens[0]
     plain_before, mixed, plain_after = per_run
     assert any(count for _, count in plain_before)
