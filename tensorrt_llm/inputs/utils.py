@@ -371,8 +371,12 @@ def _read_tensor_archive(content: bytes,
     return spec, storage
 
 
-def _b64decode_strict(text: str) -> bytes:
-    """Decode standard base64, rejecting characters outside its alphabet."""
+def _b64decode_strict(text: str, strip_whitespace: bool = False) -> bytes:
+    """Decode standard base64, rejecting characters outside its alphabet.
+
+    The text is decoded a slice at a time, carrying incomplete quartets over,
+    so no call holds the GIL for the whole payload. Padding may only end it.
+    """
     if sys.version_info >= (3, 11):
         # Unlike base64.b64decode, this does not first copy the text to bytes.
         def decode(piece: str) -> bytes:
@@ -382,15 +386,21 @@ def _b64decode_strict(text: str) -> bytes:
         def decode(piece: str) -> bytes:
             return base64.b64decode(piece, validate=True)
 
-    return b"".join(
-        decode(text[i:i + _BASE64_SLICE_CHARS])
-        for i in range(0, len(text), _BASE64_SLICE_CHARS))
-
-
-def _strip_base64_whitespace(text: str) -> str:
-    """Drop ASCII whitespace from base64 text, a slice at a time."""
-    return "".join(text[i:i + _BASE64_SLICE_CHARS].translate(_BASE64_WHITESPACE)
-                   for i in range(0, len(text), _BASE64_SLICE_CHARS))
+    parts, carry = [], ""
+    for start in range(0, len(text), _BASE64_SLICE_CHARS):
+        piece = text[start:start + _BASE64_SLICE_CHARS]
+        if strip_whitespace:
+            piece = piece.translate(_BASE64_WHITESPACE)
+        piece = carry + piece
+        if start + _BASE64_SLICE_CHARS < len(text):
+            cut = len(piece) - len(piece) % 4
+            piece, carry = piece[:cut], piece[cut:]
+            if "=" in piece:
+                raise ValueError("padding before the end of the data")
+        else:
+            carry = ""
+        parts.append(decode(piece))
+    return b"".join(parts)
 
 
 def load_base64_tensor(data: str, *, max_bytes: int) -> torch.Tensor:
@@ -425,15 +435,10 @@ def load_base64_tensor(data: str, *, max_bytes: int) -> torch.Tensor:
     try:
         content = _b64decode_strict(data)
     except ValueError as e:
-        # Line-wrapped base64 is accepted; only then is the text copied
-        # without its whitespace.
-        stripped, content = _strip_base64_whitespace(data), None
-        if stripped != data and len(stripped) <= encoded_limit:
-            try:
-                content = _b64decode_strict(stripped)
-            except ValueError:
-                pass
-        if content is None:
+        # Line-wrapped base64 is accepted; only then is whitespace stripped.
+        try:
+            content = _b64decode_strict(data, strip_whitespace=True)
+        except ValueError:
             raise ValueError(f"Tensor payload is not valid base64: {e}") from e
     if len(content) > max_bytes:
         raise ValueError(f"Tensor payload is {len(content)} bytes, over the "

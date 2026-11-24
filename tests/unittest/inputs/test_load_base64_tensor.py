@@ -427,7 +427,20 @@ def test_base64_decoded_in_slices(monkeypatch) -> None:
     wrapped = "\n".join(payload[i : i + 76] for i in range(0, len(payload), 76))
     for text in (payload, wrapped):
         assert torch.equal(load_base64_tensor(text, max_bytes=_LIMIT), tensor)
-    assert len(lengths) > 2 * len(payload) // 64 and max(lengths) <= 64
+    # A slice may carry up to three characters of an incomplete quartet.
+    assert len(lengths) > 2 * len(payload) // 64 and max(lengths) <= 64 + 3
+
+
+def test_padding_before_the_end_rejected(monkeypatch) -> None:
+    """Padding that ends a slice but not the payload is refused, as whole-text decoding does."""
+    monkeypatch.setattr(utils, "_BASE64_SLICE_CHARS", 64)
+    raw = base64.b64decode(_encode(torch.randn(100)))
+    # 47 bytes encode to 64 characters ending in one "=", exactly one slice.
+    head = base64.b64encode(raw[:47]).decode()
+    assert len(head) == 64 and head.endswith("=")
+    payload = head + base64.b64encode(raw[47:]).decode()
+    with pytest.raises(ValueError, match="not valid base64"):
+        load_base64_tensor(payload, max_bytes=_LIMIT)
 
 
 def _patch_storage_record(payload: str, data: bytes, size: int, crc: int) -> str:
