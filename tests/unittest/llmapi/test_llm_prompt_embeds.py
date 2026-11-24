@@ -19,6 +19,7 @@ import torch
 from safetensors import safe_open
 
 from tensorrt_llm import LLM
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor import RequestError
 from tensorrt_llm.executor.base_worker import BaseWorker
@@ -137,7 +138,7 @@ def test_worker_cache_salt(v2: bool, connector: Optional[object], keys_rows: boo
     params = SamplingParams(max_tokens=1)
     worker = SimpleNamespace(
         llm_args=SimpleNamespace(kv_connector_config=connector),
-        _uses_kv_cache_manager_v2=lambda: v2,
+        _cache_manager_keys_rows=lambda: v2,
     )
     worker._kv_cache_keys_prompt_embeds = lambda: BaseWorker._kv_cache_keys_prompt_embeds(worker)
     plain = GenerationRequest([1, 2, 3], params, cache_salt="s")
@@ -146,6 +147,7 @@ def test_worker_cache_salt(v2: bool, connector: Optional[object], keys_rows: boo
     assert BaseWorker._effective_cache_salt(worker, plain) == "s"
     salt = BaseWorker._effective_cache_salt(worker, embeds)
     assert salt == ("s" if keys_rows else prompt_embeds_cache_salt("s", pe.digest))
+    assert KVCacheManagerV2.keys_prompt_embeds_rows
     # A plain request cannot claim the derived salt of an embedding request.
     derived = prompt_embeds_cache_salt("s", pe.digest)
     claimed = GenerationRequest([1, 2, 3], params, cache_salt=derived)
@@ -423,8 +425,10 @@ def test_disaggregated_handoff() -> None:
             ).result()
             params = first.disaggregated_params
             params.request_type = "generation_only"
+            # The generation request takes the rows' identity from the context result.
+            gen_request = {"prompt_token_ids": req["prompt_token_ids"]}
             out = gen.generate_async(
-                req, sampling_params=_greedy(), disaggregated_params=params, cache_salt=salt
+                gen_request, sampling_params=_greedy(), disaggregated_params=params, cache_salt=salt
             ).result()
             return list(out.outputs[0].token_ids), out.cached_tokens
 
@@ -433,6 +437,22 @@ def test_disaggregated_handoff() -> None:
         assert tokens == _run(ctx, [ids])[0] and cached > mask.index(True)
         tokens, cached = handoff(other)
         assert tokens == _run(ctx, [other])[0] and cached <= mask.index(True)
+        # Rows differing from the context request's, or added to a plain one.
+        for context_prompt, gen_prompt in ((request, other), ({"prompt_token_ids": ids}, request)):
+            params = (
+                ctx.generate_async(
+                    context_prompt,
+                    sampling_params=SamplingParams(max_tokens=1),
+                    disaggregated_params=DisaggregatedParams(request_type="context_only"),
+                )
+                .result()
+                .disaggregated_params
+            )
+            params.request_type = "generation_only"
+            with pytest.raises(ValueError, match="must match"):
+                gen.generate_async(
+                    gen_prompt, sampling_params=_greedy(), disaggregated_params=params
+                )
 
 
 @pytest.mark.parametrize("request_type", ["context_only", "generation_only"])
@@ -447,7 +467,9 @@ def test_disaggregated_deployment_checks(request_type: str, v2: bool) -> None:
         disaggregated_params=DisaggregatedParams(request_type=request_type),
     )
     model = SimpleNamespace(
-        prompt_embeds_unsupported_reason=lambda: None, config=SimpleNamespace(hidden_size=4)
+        supports_prompt_embeds=True,
+        prompt_embeds_config_unsupported_reason=lambda: None,
+        config=SimpleNamespace(hidden_size=4, torch_dtype="float16"),
     )
     worker = SimpleNamespace(
         llm_args=SimpleNamespace(
@@ -455,7 +477,7 @@ def test_disaggregated_deployment_checks(request_type: str, v2: bool) -> None:
             parallel_config=SimpleNamespace(enable_attention_dp=False, cp_size=1),
         ),
         engine=SimpleNamespace(model_engine=SimpleNamespace(model=model)),
-        _uses_kv_cache_manager_v2=lambda: v2,
+        _cache_manager_keys_rows=lambda: v2,
     )
     if v2:
         BaseWorker._check_prompt_embeds(worker, request)
@@ -472,11 +494,11 @@ def test_cancel_releases_rows(llm: LLM, table: torch.Tensor) -> None:
         result = llm.generate_async(
             {"prompt_embeds": table[torch.tensor(ids)]}, sampling_params=params, streaming=True
         )
+        # The client keeps only the identity once the request is submitted.
+        assert result._generation_request.prompt_embeds.embeds is None
         result.abort()
         outputs = [output async for output in result]
         assert outputs[-1].outputs[0].finish_reason == "cancelled"
-        # The client keeps only the identity once the request is done.
-        assert result._generation_request.prompt_embeds.embeds is None
 
     asyncio.run(run())
     assert _run(llm, [ids]) == _run(llm, [{"prompt_embeds": table[torch.tensor(ids)]}])

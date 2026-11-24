@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import dataclasses
 import datetime
 import enum
 import gc
@@ -416,17 +417,15 @@ class BaseWorker(GenerationExecutor):
                                         request.prompt_embeds.digest)
 
     def _kv_cache_keys_prompt_embeds(self) -> bool:
-        """KVCacheManagerV2 keys blocks by rows; KV connectors key by ids and salt."""
+        """Whether block keys carry the rows; KV connectors key by ids and salt."""
         if self.llm_args is not None and getattr(
                 self.llm_args, "kv_connector_config", None) is not None:
             return False
-        return self._uses_kv_cache_manager_v2()
+        return self._cache_manager_keys_rows()
 
-    def _uses_kv_cache_manager_v2(self) -> bool:
-        from .._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
-            KVCacheManagerV2
-        return isinstance(getattr(self.engine, "kv_cache_manager", None),
-                          KVCacheManagerV2)
+    def _cache_manager_keys_rows(self) -> bool:
+        return getattr(getattr(self.engine, "kv_cache_manager", None),
+                       "keys_prompt_embeds_rows", False)
 
     def _check_prompt_embeds(self, request: GenerationRequest) -> None:
         """Reject prompt embeddings this engine cannot place correctly."""
@@ -435,7 +434,7 @@ class BaseWorker(GenerationExecutor):
             return
         request_type = (request.disaggregated_params.request_type
                         if request.disaggregated_params is not None else None)
-        if prompt_embeds.embeds is None:
+        if prompt_embeds.embeds is None and request_type != "generation_only":
             raise RequestError("prompt_embeds carries no rows.")
         if self.llm_args is None:
             raise RequestError("prompt_embeds requires the PyTorch backend.")
@@ -450,11 +449,10 @@ class BaseWorker(GenerationExecutor):
         if unsupported:
             raise RequestError("prompt_embeds is not supported with " +
                                ", ".join(unsupported) + ".")
+        from .._torch.models.modeling_utils import \
+            prompt_embeds_unsupported_reason
         model = self.engine.model_engine.model
-        unsupported_reason = getattr(model, "prompt_embeds_unsupported_reason",
-                                     None)
-        reason = ("it is not a decoder LLM"
-                  if unsupported_reason is None else unsupported_reason())
+        reason = prompt_embeds_unsupported_reason(model)
         if reason is not None:
             raise RequestError(
                 f"prompt_embeds is not supported by {type(model).__name__}: "
@@ -482,7 +480,7 @@ class BaseWorker(GenerationExecutor):
             raise RequestError(
                 "prompt_embeds positions exceed the prompt length.")
         if (request_type in ("context_only", "generation_only")
-                and not self._uses_kv_cache_manager_v2()):
+                and not self._cache_manager_keys_rows()):
             # The V1 transceiver looks up transferred blocks without the
             # request salt that carries the embedding identity.
             raise RequestError(
@@ -1811,7 +1809,15 @@ def _get_params_for_first_rsp(
     assert res is not None
     if not res._params_transmitted:
         res._params_transmitted = True
-        return res.sampling_params, res.postproc_params, res.disaggregated_params
+        disaggregated_params = res.disaggregated_params
+        embeds = getattr(getattr(res, "_generation_request", None),
+                         "prompt_embeds", None)
+        if (embeds is not None and disaggregated_params is not None
+                and disaggregated_params.request_type == "context_only"):
+            # Postproc records have no request to read the identity from.
+            disaggregated_params = dataclasses.replace(
+                disaggregated_params, prompt_embeds=embeds.identity_only())
+        return res.sampling_params, res.postproc_params, disaggregated_params
     return None, None, None
 
 

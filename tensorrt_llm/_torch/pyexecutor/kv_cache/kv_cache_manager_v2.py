@@ -2461,6 +2461,9 @@ def resolve_fork_join_attn(
 
 class KVCacheManagerV2(BaseResourceManager):
     gen_preemption_headroom: int = 0
+    # Block keys carry prompt_embeds rows (_augment_tokens_for_block_reuse); managers
+    # without this flag get the embedding identity through the cache salt instead.
+    keys_prompt_embeds_rows: bool = True
     # Host memory this rank donates to remote cache levels (remote_cache_config.donor); closed by shutdown().
     _remote_donor: Optional["RemoteMemDonor"] = None
     # The remote config of a donation this manager owns, started or not; a failure leaves its marker.

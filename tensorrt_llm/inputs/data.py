@@ -95,7 +95,7 @@ class TokensPrompt(TypedDict):
     prompt_embeds: NotRequired[torch.Tensor]
     """Precomputed ``[K, hidden_size]`` input embeddings for ``K`` prompt positions.
 
-    This is the prompt_embeds contract. Rows (float16, bfloat16 or float32) must
+    Prototype: the prompt_embeds inputs may change. This is the prompt_embeds contract. Rows (float16, bfloat16 or float32) must
     equal what the model's input embedding module, including any scaling, would
     produce; ``generate`` snapshots them at submission. The ids at those
     positions are placeholders that still feed repetition penalties and prompt
@@ -109,8 +109,9 @@ class TokensPrompt(TypedDict):
     Requires the PyTorch backend and a model class that opts in
     (``supports_prompt_embeds``); speculative
     decoding, attention data parallelism and context parallelism are rejected.
-    Disaggregated serving needs the V2 manager, and the generation-only request
-    must carry the same ``prompt_embeds`` as the context request.
+    Disaggregated serving needs the V2 manager; the generation-only request
+    takes the identity from the context result's ``disaggregated_params`` and
+    needs no rows (any it passes must match).
     """
 
     prompt_embeds_mask: NotRequired[Union[List[bool], torch.Tensor]]
@@ -122,7 +123,7 @@ class TokensPrompt(TypedDict):
 
 
 class EmbedsPrompt(TypedDict):
-    """Schema for a prompt given entirely as precomputed input embeddings."""
+    """Schema for a prompt given entirely as precomputed input embeddings (prototype)."""
 
     prompt_embeds: torch.Tensor
     """``[L, hidden_size]``, one row per position; see ``TokensPrompt.prompt_embeds``.

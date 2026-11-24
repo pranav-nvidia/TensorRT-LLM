@@ -144,8 +144,8 @@ class GenerationExecutor(ABC):
         ``prompt_adapter_request`` is deprecated. Prompt adapters are unsupported;
         omit this argument or pass None.
 
-        ``prompt_embeds`` comes from ``build_prompt_embeds``; its digest is
-        trusted as the KV cache identity, so its tensors must not be modified.
+        ``prompt_embeds`` is internal: only ``LLM`` builds it (``build_prompt_embeds``),
+        and its digest is trusted as the KV cache identity.
         """
         assert isinstance(prompt_token_ids, np.ndarray) or isinstance(
             prompt_token_ids[0], int)
@@ -179,6 +179,9 @@ class GenerationExecutor(ABC):
         # release memory in time
         if hasattr(request, "multimodal_params"):
             del request.multimodal_params
+        if prompt_embeds is not None:
+            # The worker holds the submitted rows; the client keeps the identity.
+            request.prompt_embeds = prompt_embeds.identity_only()
         return result
 
     def generate(

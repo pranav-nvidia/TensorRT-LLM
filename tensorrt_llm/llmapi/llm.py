@@ -925,6 +925,21 @@ class BaseLLM:
                 prompt_embeds = remap_prompt_embeds(prompt_embeds,
                                                     inputs["prompt_token_ids"],
                                                     prompt_token_ids, *spans)
+        if is_gen_only and disaggregated_params.prompt_embeds is not None:
+            # The context result carries the identity; rows are optional here.
+            identity = disaggregated_params.prompt_embeds
+            if prompt_embeds is None:
+                prompt_embeds = identity
+            elif prompt_embeds.digest != identity.digest:
+                raise ValueError(
+                    "prompt_embeds of a generation-only request must match "
+                    "the context request's.")
+        elif (is_gen_only and prompt_embeds is not None
+              and disaggregated_params.first_gen_tokens is not None):
+            # The context result came from a plain-token prompt.
+            raise ValueError(
+                "prompt_embeds of a generation-only request must match "
+                "the context request's.")
 
         if (not self.args.mm_encoder_only and disaggregated_params is not None
                 and disaggregated_params.multimodal_input_layout is not None):

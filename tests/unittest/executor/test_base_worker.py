@@ -1042,3 +1042,31 @@ def test_worker_enqueues_serializable_python_input_envelope(
         assert translated.py_return_routed_experts
         torch.testing.assert_close(translated.py_multimodal_data["embedding"],
                                    torch.ones(2, 4))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("request_type", ["context_only", "generation_only"])
+def test_first_postproc_params_carry_prompt_embeds_identity(
+        request_type: str) -> None:
+    from tensorrt_llm.disaggregated_params import DisaggregatedParams
+    from tensorrt_llm.inputs.prompt_embeds import build_prompt_embeds
+
+    _, embeds = build_prompt_embeds(None, torch.ones(3, 8))
+    result = SimpleNamespace(
+        _params_transmitted=False,
+        sampling_params=None,
+        postproc_params=None,
+        disaggregated_params=DisaggregatedParams(request_type=request_type),
+        _generation_request=SimpleNamespace(prompt_embeds=embeds))
+
+    _, _, params = base_worker._get_params_for_first_rsp(
+        SimpleNamespace(_results={1: result}), 1)
+
+    if request_type == "context_only":
+        # A postproc record has no request, so the context result reads it here.
+        assert params.prompt_embeds.digest == embeds.digest
+        assert params.prompt_embeds.embeds is None
+    else:
+        assert params.prompt_embeds is None
+    assert base_worker._get_params_for_first_rsp(
+        SimpleNamespace(_results={1: result}), 1) == (None, None, None)
