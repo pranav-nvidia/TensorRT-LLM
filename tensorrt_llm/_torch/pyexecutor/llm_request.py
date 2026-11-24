@@ -1104,6 +1104,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # Precomputed rows for some prompt positions; read-only and shared
         # with child requests.
         self.py_prompt_embeds: Optional[PromptEmbeds] = None
+        # The V2 KV cache manager's per-row block keys, filled on first use:
+        # (row positions, per-row keys or None).
+        self.py_prompt_embeds_key_memo: Optional[tuple[
+            list[int], list[Optional[bytes]]]] = None
         # The largest id of a prompt the prompt-tail transport restored
         # (executor/prompt_tail.py) when recorded; None: admission scans it.
         self.py_prompt_token_bound: Optional[int] = None

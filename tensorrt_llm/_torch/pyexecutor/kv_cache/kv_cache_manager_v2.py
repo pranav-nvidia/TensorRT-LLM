@@ -8591,6 +8591,10 @@ class KVCacheManagerV2(BaseResourceManager):
         tokens = _augment_multimodal_tokens(self.vocab_size, tokens, req, start, end)
         if prompt_embeds is None:
             return tokens
+        lo, hi = prompt_embeds.chunk_rows(start, end)
+        if lo == hi:
+            # No supplied row in this slice.
+            return tokens
         result = tokens.tolist() if hasattr(tokens, "tolist") else list(tokens)
         # A request's keys never change, and the scheduler probes the full prompt every pass.
         memo = getattr(req, "py_prompt_embeds_key_memo", None)
