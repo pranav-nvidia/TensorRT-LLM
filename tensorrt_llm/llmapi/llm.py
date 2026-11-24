@@ -1040,12 +1040,19 @@ class BaseLLM:
             prompt_token_ids = self._normalize_token_ids(
                 prompt_token_ids, "prompt_token_ids")
         if isinstance(inputs["prompt_embeds"], PromptEmbeds):
-            # A snapshot build_prompt_embeds already validated, e.g. off
-            # trtllm-serve's event loop; hashing it again would block there.
+            # A snapshot build_prompt_embeds built, e.g. off trtllm-serve's
+            # event loop; hashing it again would block there. Its rows are
+            # trusted to be unchanged since; only its shape is checked here.
             snapshot = inputs["prompt_embeds"]
+            positions = snapshot.positions
             if (prompt_token_ids is None or snapshot.embeds is None
                     or inputs.get("prompt_embeds_mask") is not None
-                    or int(snapshot.positions[-1]) >= len(prompt_token_ids)):
+                    or positions.dim() != 1 or positions.numel() == 0
+                    or tuple(snapshot.embeds.shape) != (positions.numel(),
+                                                        snapshot.hidden_size)
+                    or int(positions[0]) < 0
+                    or int(positions[-1]) >= len(prompt_token_ids) or bool(
+                        (positions[1:] <= positions[:-1]).any())):
                 raise ValueError(
                     "A PromptEmbeds snapshot needs the prompt_token_ids it "
                     "was built for and no prompt_embeds_mask.")

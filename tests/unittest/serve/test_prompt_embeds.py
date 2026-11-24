@@ -3,6 +3,7 @@
 """``prompt_embeds`` on /v1/completions and as a chat content part (CPU, fake generator)."""
 
 import base64
+import dataclasses
 import io
 import json
 from types import SimpleNamespace
@@ -459,3 +460,46 @@ def test_splice_rejects_mixed_dtypes() -> None:
     rows = [torch.zeros(1, 4), torch.zeros(1, 4, dtype=torch.float16)]
     with pytest.raises(ValueError, match="dtype"):
         splice_chat_prompt_embeds("<A><B>", parts, rows, _identity_tokenize, False)
+
+
+def _split_prompt_embeds(inputs: Dict[str, Any]) -> Any:
+    """Call ``BaseLLM._split_prompt_embeds`` on a minimal decoder-only stand-in."""
+    from tensorrt_llm.llmapi.llm import BaseLLM
+
+    llm = SimpleNamespace(
+        _PROMPT_EMBEDS_MULTIMODAL_KEYS=BaseLLM._PROMPT_EMBEDS_MULTIMODAL_KEYS,
+        _PROMPT_EMBEDS_ALLOWED_KEYS=BaseLLM._PROMPT_EMBEDS_ALLOWED_KEYS,
+        _normalize_token_ids=BaseLLM._normalize_token_ids,
+        _is_encoder_decoder_model=lambda: False,
+        args=SimpleNamespace(backend="pytorch", mm_encoder_only=False),
+        _encode_only=False,
+    )
+    return BaseLLM._split_prompt_embeds(llm, inputs)
+
+
+def test_llm_takes_prebuilt_snapshot() -> None:
+    """The LLM API takes serve's snapshot as is and refuses one that does not fit its prompt."""
+    from tensorrt_llm.inputs.prompt_embeds import build_prompt_embeds
+
+    ids, snapshot = build_prompt_embeds([5, 0, 0, 6], torch.ones(2, 4), [False, True, True, False])
+    prompt, taken = _split_prompt_embeds({"prompt_token_ids": ids, "prompt_embeds": snapshot})
+    assert taken is snapshot and prompt["prompt_token_ids"] == ids
+    bad = [
+        {"prompt_token_ids": ids[:2], "prompt_embeds": snapshot},
+        {"prompt_token_ids": ids, "prompt_embeds": snapshot.identity_only()},
+        {
+            "prompt_token_ids": ids,
+            "prompt_embeds": dataclasses.replace(snapshot, positions=torch.tensor([2, 1])),
+        },
+        {
+            "prompt_token_ids": ids,
+            "prompt_embeds": dataclasses.replace(snapshot, positions=torch.tensor([-1, 1])),
+        },
+        {
+            "prompt_token_ids": ids,
+            "prompt_embeds": dataclasses.replace(snapshot, embeds=torch.ones(3, 4)),
+        },
+    ]
+    for inputs in bad:
+        with pytest.raises(ValueError, match="PromptEmbeds snapshot"):
+            _split_prompt_embeds(inputs)
