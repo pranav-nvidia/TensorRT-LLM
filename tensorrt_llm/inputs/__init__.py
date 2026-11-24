@@ -10,7 +10,6 @@ from .evs import (compute_retained_tokens_count,
 from .multimodal import (MultimodalInput, MultimodalItemMetadata,
                          MultimodalItemPartition)
 from .multimodal_data import AudioData, BaseModalityData, VideoData
-from .prompt_embeds import PromptEmbeds
 # yapf and isort conflict on the following import blocks
 # yapf: disable
 from .registry import (BaseMultimodalDummyInputsBuilder,
@@ -48,7 +47,6 @@ __all__ = [
     "TextPrompt",
     "TokensPrompt",
     "EmbedsPrompt",
-    "PromptEmbeds",
     "InputProcessor",
     "create_input_processor",
     "create_input_processor_with_hash",

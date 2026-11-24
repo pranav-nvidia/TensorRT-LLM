@@ -1619,9 +1619,14 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
             if mm_token_indices is None:
                 raise ValueError(
                     "Image features with inputs_embeds need mm_token_indices.")
+            mm_embed = torch.cat(mm_embeds)
+            if mm_token_indices.shape[0] != mm_embed.shape[0]:
+                raise ValueError(
+                    f"Multimodal token count mismatch: found {len(mm_token_indices)} image "
+                    f"tokens in input_ids but received {mm_embed.shape[0]} image embeddings."
+                )
             inputs_embeds = inputs_embeds.index_copy(
-                0, mm_token_indices,
-                torch.cat(mm_embeds).to(inputs_embeds.dtype))
+                0, mm_token_indices, mm_embed.to(inputs_embeds.dtype))
         return super().forward(attn_metadata,
                                input_ids,
                                position_ids,

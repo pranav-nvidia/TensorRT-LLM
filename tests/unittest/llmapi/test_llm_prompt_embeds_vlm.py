@@ -61,7 +61,10 @@ def model_dir(request) -> str:
 def llm(model_dir: str) -> Iterator[LLM]:
     with LLM(
         model=model_dir,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4, enable_block_reuse=True),
+        # Token caps keep this engine and the chunked case's second one within an A10.
+        kv_cache_config=KvCacheConfig(
+            free_gpu_memory_fraction=0.4, max_tokens=8192, enable_block_reuse=True
+        ),
         max_batch_size=4,
     ) as instance:
         yield instance
@@ -110,7 +113,10 @@ def test_prompt_embeds_with_image_in_one_request(llm: LLM, model_dir: str, chunk
         with LLM(
             model=model_dir,
             kv_cache_config=KvCacheConfig(
-                free_gpu_memory_fraction=0.3, enable_block_reuse=True, tokens_per_block=32
+                free_gpu_memory_fraction=0.3,
+                max_tokens=2048,
+                enable_block_reuse=True,
+                tokens_per_block=32,
             ),
             enable_chunked_prefill=True,
             max_num_tokens=32,
@@ -157,7 +163,7 @@ def _check_image_swap(llm: LLM, model_dir: str, reuse: bool) -> None:
         assert (out.cached_tokens > 0) == repeat
 
 
-def _video_request(llm: LLM) -> dict:
+def _video_request(llm: LLM, text_first: bool = False) -> dict:
     """Chat prompt with one video placeholder and a short red-then-blue clip."""
     indices = [0, 80, 160, 239]
     frames = []
@@ -178,7 +184,9 @@ def _video_request(llm: LLM) -> dict:
         [
             {
                 "role": "user",
-                "content": [{"type": "video"}, {"type": "text", "text": "What happens?"}],
+                "content": [{"type": "video"}, {"type": "text", "text": "What happens?"}][
+                    :: -1 if text_first else 1
+                ],
             }
         ],
         tokenize=False,
@@ -191,18 +199,23 @@ def _video_request(llm: LLM) -> dict:
     }
 
 
-def test_prompt_embeds_with_video_in_one_request(llm: LLM, model_dir: str) -> None:
+@pytest.mark.parametrize("text_first", [False, True], ids=["video_first", "text_first"])
+def test_prompt_embeds_with_video_in_one_request(
+    llm: LLM, model_dir: str, text_first: bool
+) -> None:
     # Qwen3-VL frames each video frame with timestamp text the mask never indexes.
+    # Text first: "?" before the video merges with the first timestamp's "<".
     if "Qwen3-VL" not in model_dir:
         pytest.skip("timestamp-framed video layout is Qwen3-VL specific")
     table = _text_embedding_table(model_dir)
-    plain = _video_request(llm)
+    plain = _video_request(llm, text_first)
     ids = plain["prompt_token_ids"]
     expected = _run(llm, [plain])
     vision_ids = set(
         llm.tokenizer.convert_tokens_to_ids(["<|vision_start|>", "<|video_pad|>", "<|vision_end|>"])
     )
-    mask = [t not in vision_ids and p % 2 == 1 for p, t in enumerate(ids)]
+    merged = min(p for p, t in enumerate(ids) if t in vision_ids) - 1
+    mask = [t not in vision_ids and p % 2 == 1 and p != merged for p, t in enumerate(ids)]
     request = {
         **plain,
         "prompt_embeds": table[torch.tensor([t for t, m in zip(ids, mask) if m])],

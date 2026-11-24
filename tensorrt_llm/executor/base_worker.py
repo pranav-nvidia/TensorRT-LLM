@@ -41,7 +41,7 @@ from .._utils import (global_mpi_rank, global_mpi_size, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..bindings.BuildInfo import check_cuda_architecture_supported
-from ..inputs.prompt_embeds import prompt_embeds_cache_salt
+from ..inputs.prompt_embeds import plain_cache_salt, prompt_embeds_cache_salt
 from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
                                         configure_moe_launch_queues,
                                         uses_collective_shutdown)
@@ -411,7 +411,7 @@ class BaseWorker(GenerationExecutor):
                               request: GenerationRequest) -> Optional[str]:
         """Fold the embedding identity into the salt unless block keys carry it."""
         if request.prompt_embeds is None or self._kv_cache_keys_prompt_embeds():
-            return request.cache_salt
+            return plain_cache_salt(request.cache_salt)
         return prompt_embeds_cache_salt(request.cache_salt,
                                         request.prompt_embeds.digest)
 
@@ -460,13 +460,24 @@ class BaseWorker(GenerationExecutor):
                 f"prompt_embeds is not supported by {type(model).__name__}: "
                 f"{reason}.")
         config = model.config
-        hidden_size = getattr(config, "hidden_size", None)
-        if hidden_size is None:
-            hidden_size = config.text_config.hidden_size
+        if getattr(config, "hidden_size", None) is None:
+            config = config.text_config
+        hidden_size = config.hidden_size
         if prompt_embeds.hidden_size != hidden_size:
             raise RequestError(
                 f"prompt_embeds hidden size ({prompt_embeds.hidden_size}) "
                 f"does not match the model hidden size ({hidden_size}).")
+        model_dtype = getattr(config, "torch_dtype", None)
+        if isinstance(model_dtype, str):
+            model_dtype = getattr(torch, model_dtype, None)
+        # A generation-only request carries no rows to range-check.
+        if (model_dtype == torch.float16 and prompt_embeds.embeds is not None
+                and prompt_embeds.dtype != torch.float16
+                and bool(prompt_embeds.embeds.abs().max() > torch.finfo(
+                    torch.float16).max)):
+            raise RequestError(
+                "prompt_embeds holds values outside the float16 range of "
+                "this model.")
         if int(prompt_embeds.positions[-1]) >= request.prompt_len:
             raise RequestError(
                 "prompt_embeds positions exceed the prompt length.")

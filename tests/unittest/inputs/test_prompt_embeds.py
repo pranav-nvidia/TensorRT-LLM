@@ -52,19 +52,25 @@ def test_build_positions(
 
 
 @pytest.mark.parametrize(
-    "ids, embeds, mask, error",
+    "ids, embeds, mask, error, match",
     [
-        ([1, 2, 3], _rows(2), None, ValueError),
-        ([1, 2, 3], _rows(2), [True, False], ValueError),
-        ([1, 2, 3], _rows(1), [True, True, False], ValueError),
-        ([1, 2, 3], _rows(2), [1, 1, 0], TypeError),
-        ([1, 2, 3], _rows(2), torch.tensor([1, 1, 0]), TypeError),
-        (None, _rows(2), [True, True], ValueError),
-        ([1, 2], _rows(2).to(torch.int32), None, TypeError),
-        ([1, 2], _rows(2)[None], None, ValueError),
-        ([1, 2], [[0.0] * HIDDEN] * 2, None, TypeError),
-        ([], torch.empty(0, HIDDEN), None, ValueError),
-        ([1, 2], _rows(2).index_fill(1, torch.tensor([3]), float("nan")), None, ValueError),
+        ([1, 2, 3], _rows(2), None, ValueError, "rows for"),
+        ([1, 2, 3], _rows(2), [True, False], ValueError, "length"),
+        ([1, 2, 3], _rows(1), [True, True, False], ValueError, "selects"),
+        ([1, 2, 3], _rows(2), [1, 1, 0], TypeError, "only bools"),
+        ([1, 2, 3], _rows(2), torch.tensor([1, 1, 0]), TypeError, "torch.bool"),
+        (None, _rows(2), [True, True], ValueError, "requires prompt_token_ids"),
+        ([1, 2], _rows(2).to(torch.int32), None, TypeError, "dtype"),
+        ([1, 2], _rows(2)[None], None, ValueError, "shape"),
+        ([1, 2], [[0.0] * HIDDEN] * 2, None, TypeError, "torch.Tensor"),
+        ([], torch.empty(0, HIDDEN), None, ValueError, "at least one row"),
+        (
+            [1, 2],
+            _rows(2).index_fill(1, torch.tensor([3]), float("nan")),
+            None,
+            ValueError,
+            "non-finite",
+        ),
     ],
 )
 def test_rejects_malformed(
@@ -72,8 +78,9 @@ def test_rejects_malformed(
     embeds: object,
     mask: object,
     error: type[Exception],
+    match: str,
 ) -> None:
-    with pytest.raises(error):
+    with pytest.raises(error, match=match):
         build_prompt_embeds(ids, embeds, mask)
 
 
@@ -202,14 +209,20 @@ def test_remap_through_framed_video_expansion() -> None:
     expanded = [1, 60, 50, 53, 53, 52, 61, 50, 53, 53, 52, 2, 3]
     _, pe = build_prompt_embeds(original, _rows(2), [True, False, False, False, True, False])
     assert remap_prompt_embeds(pe, original, expanded, [(3, 10)]).positions.tolist() == [0, 11]
-    # Text inserted away from the item's framing is rejected.
-    original = [1, 2, 50, 53, 52, 3, 4]
-    shifted = [1, 70, 2, 60, 50, 53, 53, 52, 3, 4]
-    _, pe = build_prompt_embeds(original, _rows(1), [False] * 6 + [True])
+    # Text after the last item must re-tokenize to itself.
     with pytest.raises(ValueError, match="did not survive"):
-        remap_prompt_embeds(pe, original, shifted, [(5, 7)])
-    del shifted[1]
-    assert remap_prompt_embeds(pe, original, shifted, [(4, 6)]).positions.tolist() == [8]
+        remap_prompt_embeds(pe, original, expanded[:-1] + [9, 3], [(3, 10)])
+
+
+def test_remap_text_merged_with_framing() -> None:
+    # Qwen3-VL: "?" before the video merges with the timestamp's "<" into one token (62).
+    original = [1, 2, 50, 53, 52, 3]
+    expanded = [1, 62, 60, 50, 53, 53, 52, 3]
+    _, pe = build_prompt_embeds(original, _rows(2), [True] + [False] * 4 + [True])
+    assert remap_prompt_embeds(pe, original, expanded, [(4, 6)]).positions.tolist() == [0, 7]
+    _, merged = build_prompt_embeds(original, _rows(1), [False, True] + [False] * 4)
+    with pytest.raises(ValueError, match="merged"):
+        remap_prompt_embeds(merged, original, expanded, [(4, 6)])
 
 
 def test_remap_text_after_video_matching_timestamp() -> None:

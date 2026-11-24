@@ -7,7 +7,7 @@ The request contract is documented once, on ``TokensPrompt.prompt_embeds``.
 
 import hashlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Sequence
 
 import torch
 
@@ -20,9 +20,11 @@ PROMPT_EMBEDS_IDENTITY_VERSION = 1
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
-# Caller cache salts may not start with this, so no plain request can reproduce a derived salt.
-RESERVED_CACHE_SALT_PREFIX = "prompt_embeds."
-_SALT_PREFIX = f"{RESERVED_CACHE_SALT_PREFIX}v{PROMPT_EMBEDS_IDENTITY_VERSION}:"
+# Derived salts live under this prefix; caller salts that start with it are hashed into a
+# separate namespace (``plain_cache_salt``), so no plain request can reproduce a derived salt.
+_DERIVED_SALT_NAMESPACE = "prompt_embeds."
+_SALT_PREFIX = f"{_DERIVED_SALT_NAMESPACE}v{PROMPT_EMBEDS_IDENTITY_VERSION}:"
+_ESCAPED_SALT_PREFIX = f"{_DERIVED_SALT_NAMESPACE}user:"
 
 
 @dataclass(frozen=True)
@@ -38,7 +40,7 @@ class PromptEmbeds:
         digest: Hex SHA-256 over dtype, shape, positions and row digests.
     """
 
-    embeds: Optional[torch.Tensor]
+    embeds: torch.Tensor | None
     positions: torch.Tensor
     hidden_size: int
     row_digests: bytes
@@ -48,17 +50,19 @@ class PromptEmbeds:
     def num_rows(self) -> int:
         return int(self.positions.numel())
 
-    def chunk_rows(self, begin: int, end: int) -> Tuple[int, int]:
+    def chunk_rows(self, begin: int, end: int) -> tuple[int, int]:
         """Return the row range ``(lo, hi)`` whose positions fall in ``[begin, end)``."""
         lo = int(torch.searchsorted(self.positions, begin, right=False))
         hi = int(torch.searchsorted(self.positions, end, right=False))
         return lo, hi
 
     def covers(self, position: int) -> bool:
+        """Return whether prompt ``position`` takes a supplied row."""
         lo, hi = self.chunk_rows(position, position + 1)
         return hi > lo
 
     def row_digest(self, row: int) -> bytes:
+        """Return the 32-byte SHA-256 digest of row index ``row`` (not a prompt position)."""
         return self.row_digests[row * _ROW_DIGEST_LEN : (row + 1) * _ROW_DIGEST_LEN]
 
     def identity_only(self) -> "PromptEmbeds":
@@ -94,7 +98,7 @@ def _digest(embeds: torch.Tensor, positions: torch.Tensor, row_digests: bytes) -
     return h.hexdigest()
 
 
-def _as_mask(mask: Union[Sequence[bool], torch.Tensor], length: int) -> torch.Tensor:
+def _as_mask(mask: Sequence[bool] | torch.Tensor, length: int) -> torch.Tensor:
     if isinstance(mask, torch.Tensor):
         if mask.dim() != 1:
             raise ValueError(f"prompt_embeds_mask must be 1-D, got shape {tuple(mask.shape)}")
@@ -115,11 +119,11 @@ def _as_mask(mask: Union[Sequence[bool], torch.Tensor], length: int) -> torch.Te
 
 
 def build_prompt_embeds(
-    prompt_token_ids: Optional[List[int]],
+    prompt_token_ids: list[int] | None,
     prompt_embeds: torch.Tensor,
-    prompt_embeds_mask: Optional[Union[Sequence[bool], torch.Tensor]] = None,
+    prompt_embeds_mask: Sequence[bool] | torch.Tensor | None = None,
     placeholder_token_id: int = 0,
-) -> Tuple[List[int], PromptEmbeds]:
+) -> tuple[list[int], PromptEmbeds]:
     """Validate a ``TokensPrompt``/``EmbedsPrompt`` request and snapshot its rows.
 
     The contract is on ``TokensPrompt.prompt_embeds``.
@@ -196,7 +200,7 @@ def build_prompt_embeds(
     return prompt_token_ids, snapshot
 
 
-def prompt_embeds_cache_salt(user_salt: Optional[str], digest: str) -> str:
+def prompt_embeds_cache_salt(user_salt: str | None, digest: str) -> str:
     """Return the cache salt that scopes reuse to identical embeddings.
 
     Used where blocks are keyed by token ids alone (the V1 manager, KV connectors).
@@ -209,12 +213,22 @@ def prompt_embeds_cache_salt(user_salt: Optional[str], digest: str) -> str:
     return _SALT_PREFIX + h.hexdigest()
 
 
+def plain_cache_salt(user_salt: str | None) -> str | None:
+    """Return the cache salt of a request without prompt embeddings.
+
+    Salts outside the derived namespace pass through unchanged.
+    """
+    if user_salt is None or not user_salt.startswith(_DERIVED_SALT_NAMESPACE):
+        return user_salt
+    return _ESCAPED_SALT_PREFIX + hashlib.sha256(user_salt.encode("utf-8")).hexdigest()
+
+
 def remap_prompt_embeds(
     prompt_embeds: PromptEmbeds,
     original_ids: Sequence[int],
     expanded_ids: Sequence[int],
     item_spans: Sequence[tuple[int, int]],
-    run_spans: Optional[Sequence[tuple[int, int]]] = None,
+    run_spans: Sequence[tuple[int, int]] | None = None,
 ) -> PromptEmbeds:
     """Move prompt-embedding positions through multimodal placeholder expansion.
 
@@ -222,10 +236,10 @@ def remap_prompt_embeds(
     possibly framed by extra tokens (for example Qwen3-VL per-frame timestamps
     and vision markers). The ``k``-th placeholder in ``original_ids`` (the token
     at item ``k``'s first row) anchors to that row. The original tokens between
-    two placeholders are matched, in order, only within the expanded tokens
-    between the two items' spans; unmatched tokens there may only be framing
-    inserted right before the next item. No embedding position may be a
-    placeholder.
+    two items must re-tokenize to themselves, except where framing is inserted
+    right before the next item: the tokens around it match from both ends, and
+    a text token merged with the framing is left unplaced. No embedding
+    position may be a placeholder or an unplaced token.
 
     Args:
         prompt_embeds: Snapshot whose positions index ``original_ids``.
@@ -277,6 +291,12 @@ def remap_prompt_embeds(
     rows = prompt_embeds.positions.tolist()
     if any(p in placeholders for p in rows):
         raise ValueError("prompt_embeds_mask selects a multimodal placeholder position.")
+    if any(mapping[p] < 0 for p in rows):
+        raise ValueError(
+            "prompt_embeds_mask selects a token that multimodal processing merged "
+            "with the framing it inserts before an item (for example a Qwen3-VL "
+            "frame timestamp); keep that position a token."
+        )
     positions = torch.tensor([mapping[p] for p in rows], dtype=torch.int64, device="cpu")
     embeds = prompt_embeds.embeds
     return PromptEmbeds(
@@ -300,31 +320,29 @@ def _raise_unaligned() -> None:
 def _align_gap(
     segment: Sequence[int], expanded_ids: Sequence[int], begin: int, end: int, framed: bool
 ) -> list[int]:
-    """Return the expanded index of each ``segment`` token, matched in order in ``[begin, end)``.
+    """Return the expanded index of each ``segment`` token in ``[begin, end)``, or -1 if unplaced.
 
-    ``framed``: an item starts at ``end`` and its framing may precede it.
+    ``framed``: an item starts at ``end`` and framing inserted before it may
+    merge with the last text tokens, so the segment matches from both ends.
     """
-    mapping = []
-    j = begin
-    for token in segment:
-        while j < end and expanded_ids[j] != token:
-            j += 1
-        if j == end:
-            _raise_unaligned()
-        mapping.append(j)
-        j += 1
-    # Unmatched tokens may only be the next item's framing: after the
-    # second-to-last matched token, i.e. around the item's start marker.
+    n = len(segment)
+    head = 0
+    while head < n and begin + head < end and expanded_ids[begin + head] == segment[head]:
+        head += 1
     if not framed:
-        framing_from = end
-    elif len(mapping) >= 2:
-        framing_from = mapping[-2] + 1
-    else:
-        framing_from = begin
-    matched = set(mapping)
-    if any(k not in matched for k in range(begin, framing_from)):
-        _raise_unaligned()
-    return mapping
+        if head != n or begin + n != end:
+            _raise_unaligned()
+        return list(range(begin, end))
+    tail = 0
+    while (
+        tail < n - head
+        and end - 1 - tail >= begin + head
+        and expanded_ids[end - 1 - tail] == segment[n - 1 - tail]
+    ):
+        tail += 1
+    return (
+        list(range(begin, begin + head)) + [-1] * (n - head - tail) + list(range(end - tail, end))
+    )
 
 
 def multimodal_item_spans(multimodal_input: "MultimodalInput") -> list[tuple[int, int]]:

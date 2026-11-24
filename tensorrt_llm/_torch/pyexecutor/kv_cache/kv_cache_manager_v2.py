@@ -1728,15 +1728,25 @@ def _augment_tokens_with_prompt_embeds(
     prompt_embeds: "PromptEmbeds",
     chunk_start: int,
     chunk_end: int,
+    memo: Optional[tuple[list[int], list[Optional[bytes]]]] = None,
 ) -> list[TokenIdExt]:
     """Key the embedding positions of ``result`` (prompt ``[chunk_start, chunk_end)``).
 
     The placeholder id stays in the key because some models still read it.
+    ``memo``: the request's row positions and the keys computed so far, filled in place.
     """
+    if memo is None:
+        memo = (prompt_embeds.positions.tolist(), [None] * prompt_embeds.num_rows)
+    positions, keys = memo
     lo, hi = prompt_embeds.chunk_rows(chunk_start, chunk_end)
     for row in range(lo, hi):
-        offset = int(prompt_embeds.positions[row]) - chunk_start
-        result[offset] = prompt_embeds_block_key(prompt_embeds.row_digest(row), int(result[offset]))
+        offset = positions[row] - chunk_start
+        key = keys[row]
+        if key is None:
+            key = keys[row] = prompt_embeds_block_key(
+                prompt_embeds.row_digest(row), int(result[offset])
+            )
+        result[offset] = key
     return result
 
 
@@ -8579,7 +8589,12 @@ class KVCacheManagerV2(BaseResourceManager):
         if prompt_embeds is None:
             return tokens
         result = tokens.tolist() if hasattr(tokens, "tolist") else list(tokens)
-        return _augment_tokens_with_prompt_embeds(result, prompt_embeds, start, end)
+        # A request's keys never change, and the scheduler probes the full prompt every pass.
+        memo = getattr(req, "py_prompt_embeds_key_memo", None)
+        if memo is None:
+            memo = (prompt_embeds.positions.tolist(), [None] * prompt_embeds.num_rows)
+            req.py_prompt_embeds_key_memo = memo
+        return _augment_tokens_with_prompt_embeds(result, prompt_embeds, start, end, memo)
 
     def _stats_window_size(self, window_size: Optional[int]) -> int:
         return self.max_seq_len if window_size is None else int(window_size)

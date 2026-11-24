@@ -381,6 +381,7 @@ def test_enqueue_request_wraps_lora_load_error():
         "Request", (), {
             "id": 1,
             "prompt_adapter_request": None,
+            "prompt_embeds": None,
             "lora_request": type("LoraRequest", (), {"adapter_id": 999})(),
         })()
 
@@ -429,6 +430,7 @@ def test_lora_identity_rejects_conflicting_request(
             worker._enqueue_request(
                 SimpleNamespace(id=1,
                                 prompt_adapter_request=None,
+                                prompt_embeds=None,
                                 lora_request=conflict))
     assert warning.call_args.args[1:3] == ("7", (path, "hf"))
     assert worker._lora_manager.load_from_ckpt.call_count == 1
@@ -971,14 +973,14 @@ def test_rpc_submit_rejects_prompt_adapters_before_dispatch(
         with pytest.raises(RequestError,
                            match="Prompt adapters are not supported"):
             executor_class.submit(proxy, request)
-        proxy.rpc_client.submit.assert_not_called()
+        proxy.rpc_client.submit_from_proxy.assert_not_called()
         proxy._get_next_client_id.assert_not_called()
         assert request.id is None
         assert proxy._results == {8: peer_result}
     else:
         result = executor_class.submit(proxy, request)
-        proxy.rpc_client.submit.assert_called_once_with(request)
-        proxy.rpc_client.submit.return_value.remote.assert_called_once_with(
+        proxy.rpc_client.submit_from_proxy.assert_called_once_with(request)
+        proxy.rpc_client.submit_from_proxy.return_value.remote.assert_called_once_with(
             need_response=False)
         assert request.id == 7
         assert proxy._results == {7: result, 8: peer_result}

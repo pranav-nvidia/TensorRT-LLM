@@ -98,14 +98,16 @@ class TokensPrompt(TypedDict):
     This is the prompt_embeds contract. Rows (float16, bfloat16 or float32) must
     equal what the model's input embedding module, including any scaling, would
     produce; ``generate`` snapshots them at submission. The ids at those
-    positions are placeholders that still feed repetition penalties, prompt
-    logprobs and KV cache events. KV blocks are reused only across identical ids
-    and rows; with the V2 KV cache manager blocks before the first row are
-    shared with plain-token prompts. Models that read ids after the embedding
-    still see the ids there (Gemma4 per-layer embeddings use the pad id instead;
-    DeepSeek-V4 and Qwen4-Exp use the placeholder), so their output can depend
-    on the placeholder choice. Requires the PyTorch backend and a decoder
-    model whose ``prompt_embeds_unsupported_reason`` returns None; speculative
+    positions are placeholders that still feed repetition penalties and prompt
+    logprobs; on the V2 KV cache manager, KV cache events report each embedding
+    position as a row key rather than its id. KV blocks are reused only across
+    identical ids and rows; with the V2 KV cache manager and no KV connector,
+    blocks before the first row are shared with plain-token prompts. Models
+    that read ids after the embedding still see the ids there (Gemma4
+    per-layer embeddings use the pad id instead), so their output can depend
+    on the placeholder choice.
+    Requires the PyTorch backend and a model class that opts in
+    (``supports_prompt_embeds``); speculative
     decoding, attention data parallelism and context parallelism are rejected.
     Disaggregated serving needs the V2 manager, and the generation-only request
     must carry the same ``prompt_embeds`` as the context request.
@@ -123,7 +125,10 @@ class EmbedsPrompt(TypedDict):
     """Schema for a prompt given entirely as precomputed input embeddings."""
 
     prompt_embeds: torch.Tensor
-    """``[L, hidden_size]``, one row per position; see ``TokensPrompt.prompt_embeds``."""
+    """``[L, hidden_size]``, one row per position; see ``TokensPrompt.prompt_embeds``.
+
+    Every position schedules token id 0 as its placeholder.
+    """
 
 
 PromptInputs = Union[str, List[int], TextPrompt, TokensPrompt]

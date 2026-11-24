@@ -855,6 +855,7 @@ class TestInflightPrefixWait:
         req.get_tokens_view.return_value = tokens
         req.cache_salt = None
         req.multimodal_hashes = None
+        req.py_prompt_embeds = None
         req.is_dummy_request = False
         req.is_dummy = False
         return req

@@ -889,8 +889,9 @@ class BaseLLM:
             self._configure_bart_decoder_prefix(sampling_params)
 
         prompt_embeds = None
-        if isinstance(inputs, dict) and ("prompt_embeds" in inputs
-                                         or "prompt_embeds_mask" in inputs):
+        if isinstance(inputs,
+                      dict) and (inputs.get("prompt_embeds") is not None or
+                                 inputs.get("prompt_embeds_mask") is not None):
             inputs, prompt_embeds = self._split_prompt_embeds(inputs)
 
         if isinstance(inputs, PreprocessedInputs):
@@ -1059,8 +1060,9 @@ class BaseLLM:
                     "decoder_input_token_ids is not supported. Pass decoder "
                     "token IDs as inputs.")
 
-        if isinstance(inputs, dict) and ("prompt_embeds" in inputs
-                                         or "prompt_embeds_mask" in inputs):
+        if isinstance(inputs,
+                      dict) and (inputs.get("prompt_embeds") is not None or
+                                 inputs.get("prompt_embeds_mask") is not None):
             raise ValueError(
                 "prompt_embeds is only accepted by generate() and "
                 "generate_async(); it cannot be preprocessed separately.")
@@ -1368,7 +1370,8 @@ class BaseLLM:
         batch_multi_item_part_lens = []
         for inp in inputs:
             inp = prompt_inputs(inp)
-            if "prompt_embeds" in inp or "prompt_embeds_mask" in inp:
+            if (inp.get("prompt_embeds") is not None
+                    or inp.get("prompt_embeds_mask") is not None):
                 raise ValueError("prompt_embeds is not supported by encode().")
             if "prompt_token_ids" in inp:
                 inp_tok = cast(TokensPrompt, inp)
