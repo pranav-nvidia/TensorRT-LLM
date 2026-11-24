@@ -158,6 +158,21 @@ def test_completion_request_byte_limit(serve_env: ServeTestEnv, monkeypatch) -> 
     assert len(server.generator.generate_calls) == 1
 
 
+def test_completion_byte_limit_counts_whole_storage(serve_env: ServeTestEnv, monkeypatch) -> None:
+    """A small view saved with a large storage is charged for all of it."""
+    monkeypatch.setenv(PROMPT_EMBEDS_MAX_BYTES_ENV, "10000")
+    view = torch.zeros(1500)[: 2 * HIDDEN].view(2, HIDDEN)  # 6000 bytes stored
+    buf = io.BytesIO()
+    torch.save(view, buf)
+    payload = base64.b64encode(buf.getvalue()).decode("ascii")
+    server, client = _client(serve_env)
+    with client:
+        assert _completion(client, prompt_embeds=payload).status_code == 200
+        response = _completion(client, prompt_embeds=[payload, payload])
+    assert response.status_code == 400
+    assert len(server.generator.generate_calls) == 1
+
+
 def test_completion_line_wrapped_payload_near_limit(serve_env: ServeTestEnv, monkeypatch) -> None:
     """Line breaks in a payload do not count toward the request byte limit."""
     payload = _b64(torch.zeros(16, HIDDEN))
@@ -319,14 +334,15 @@ def test_harmony_refuses_parts(serve_env: ServeTestEnv) -> None:
     assert server.generator.generate_calls == []
 
 
-@pytest.mark.parametrize("escaped", [False, True])
+@pytest.mark.parametrize("encoding", ["utf-8", "escaped", "utf-16"])
 @pytest.mark.parametrize("enabled", [True, False])
 def test_harmony_refuses_parts_in_tool_messages(
-    serve_env: ServeTestEnv, enabled: bool, escaped: bool
+    serve_env: ServeTestEnv, enabled: bool, encoding: str
 ) -> None:
     """A tool message with tool_call_id validates its content lazily; it is still refused.
 
-    ``escaped`` spells the part type with a JSON unicode escape.
+    ``escaped`` spells the part type with a JSON unicode escape; ``utf-16``
+    sends the JSON in UTF-16, which JSON parsing also accepts.
     """
     server = serve_env.build_openai_server(
         AggConfig(model_type="gpt_oss", enable_prompt_embeds=enabled)
@@ -343,9 +359,10 @@ def test_harmony_refuses_parts_in_tool_messages(
         {"role": "tool", "tool_call_id": "c1", "content": [_part(torch.zeros(2, 4))]},
     ]
     body = json.dumps({"model": "fake-model", "max_tokens": 1, "messages": messages})
-    if escaped:
+    if encoding == "escaped":
         body = body.replace('"prompt_embeds"', '"prompt_\\u0065mbeds"')
         assert '"prompt_embeds"' not in body
+    body = body.encode("utf-16" if encoding == "utf-16" else "utf-8")
     with serve_env.client(server.app) as client:
         response = client.post(
             "/v1/chat/completions", content=body, headers={"content-type": "application/json"}

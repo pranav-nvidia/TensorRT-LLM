@@ -105,8 +105,8 @@ def decode_prompt_embeds(
     remaining = max_bytes
     for index, payload in enumerate(payloads):
         tensor = load_base64_tensor(payload, max_bytes=remaining)
-        # Logical size: an expanded view stores little but materializes all.
-        remaining -= tensor.numel() * tensor.element_size()
+        # The whole storage is held, even under a smaller view of it.
+        remaining -= tensor.untyped_storage().nbytes()
         if tensor.dim() != 2:
             raise ValueError(
                 f"prompt_embeds[{index}] must have shape [num_tokens, hidden_size], "
