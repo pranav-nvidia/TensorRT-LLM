@@ -7,10 +7,12 @@ output of the equivalent token prompt exactly, whichever positions carry them.
 """
 
 import asyncio
+import gc
 import json
 import os
 import pickle
 import uuid
+import weakref
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Iterator, List, Optional
@@ -20,7 +22,10 @@ import pytest
 import torch
 from safetensors import safe_open
 
+import tensorrt_llm.llmapi.llm as llm_module
 from tensorrt_llm import LLM
+from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner import BreakableCUDAGraphRunner
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor import RequestError
@@ -580,27 +585,87 @@ def test_disaggregated_deployment_checks(request_type: str, v2: bool) -> None:
             BaseWorker._check_prompt_embeds(worker, request)
 
 
-def test_cancel_releases_rows(llm: LLM, table: torch.Tensor) -> None:
-    ids = _token_ids(llm, PROMPTS[:1])[0]
-    params = SamplingParams(max_tokens=200, temperature=0.0, end_id=-1)
+def test_cancel_releases_worker_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Cancelling an active request (n=2: the children share its rows) and one
+    # still queued behind it frees the rows the worker owns. The worker runs in
+    # this process, so the test can hold weak references to them.
+    model = get_model_path(QWEN3)
+    if not os.path.isdir(model):
+        pytest.skip(f"{model} not found")
+    table = _embedding_table(model)
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+    monkeypatch.setenv("TLLM_ALLOW_N_GREEDY_DECODING", "1")
+    owned_rows = []
 
-    async def run() -> None:
-        result = llm.generate_async(
-            {"prompt_embeds": table[torch.tensor(ids)]}, sampling_params=params, streaming=True
-        )
-        # The client keeps only the identity once the request is submitted.
-        assert result._generation_request.prompt_embeds.embeds is None
-        result.abort()
-        outputs = [output async for output in result]
-        assert outputs[-1].outputs[0].finish_reason == "cancelled"
+    def build_and_track(*args, **kwargs) -> tuple:
+        prompt_token_ids, prompt_embeds = build_prompt_embeds(*args, **kwargs)
+        owned_rows.append(weakref.ref(prompt_embeds.embeds))
+        return prompt_token_ids, prompt_embeds
 
-    asyncio.run(run())
-    assert _run(llm, [ids]) == _run(llm, [{"prompt_embeds": table[torch.tensor(ids)]}])
+    monkeypatch.setattr(llm_module, "build_prompt_embeds", build_and_track)
+    # Two slots: the n=2 request fills both, so the second one waits in the queue.
+    with LLM(
+        model=model,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.3),
+        max_batch_size=2,
+    ) as llm:
+        ids = _token_ids(llm, PROMPTS[:1])[0]
+        request = {"prompt_embeds": table[torch.tensor(ids)]}
+
+        def params(n: int) -> SamplingParams:
+            return SamplingParams(max_tokens=1000, n=n, temperature=0.0, end_id=-1)
+
+        async def run() -> None:
+            active = llm.generate_async(request, sampling_params=params(2), streaming=True)
+            stream = active.__aiter__()
+            await stream.__anext__()
+            queued = llm.generate_async(request, sampling_params=params(1), streaming=True)
+            for _ in range(4):
+                await stream.__anext__()
+            assert not queued.outputs[0].token_ids
+            # The client keeps only the identity; the worker still owns both payloads.
+            assert active._generation_request.prompt_embeds.embeds is None
+            assert all(ref() is not None for ref in owned_rows)
+            for result in (active, queued):
+                result.abort()
+                outputs = [output async for output in result]
+                assert outputs[-1].outputs[0].finish_reason == "cancelled"
+
+        asyncio.run(run())
+        assert len(owned_rows) == 2
+        # A later request runs to completion, so the executor has moved past both.
+        assert llm.generate(ids, _greedy()).outputs[0].token_ids
+        gc.collect()
+        assert all(ref() is None for ref in owned_rows)
 
 
 @pytest.mark.parametrize("backend", ["piecewise", "breakable"])
-def test_prefill_cuda_graph(model_dir: str, table: torch.Tensor, backend: str) -> None:
-    # Passes with embedding rows run eagerly; plain prefills keep replaying graphs.
+def test_prefill_cuda_graph(
+    model_dir: str, table: torch.Tensor, backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Passes with embedding rows run eagerly; plain prefills replay graphs
+    # before and after them. The worker runs in this process, so the test
+    # counts graph replays per context pass.
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+    replays = [0]
+    for owner in (torch.cuda.CUDAGraph, BreakableCUDAGraphRunner):
+
+        def counted(self, *args, _replay=owner.replay, **kwargs):
+            replays[0] += 1
+            return _replay(self, *args, **kwargs)
+
+        monkeypatch.setattr(owner, "replay", counted)
+    passes = []  # (carries embedding rows, graph replays) per context pass
+    forward_step = DecoderRunner._forward_step
+
+    def recorded(self, inputs: dict, **kwargs) -> dict:
+        has_rows, before = "prompt_embeds_overlay" in inputs, replays[0]
+        outputs = forward_step(self, inputs, **kwargs)
+        if not kwargs.get("is_dummy") and inputs["attn_metadata"].num_contexts:
+            passes.append((has_rows, replays[0] - before))
+        return outputs
+
+    monkeypatch.setattr(DecoderRunner, "_forward_step", recorded)
     with LLM(
         model=model_dir,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.3, enable_block_reuse=False),
@@ -609,7 +674,15 @@ def test_prefill_cuda_graph(model_dir: str, table: torch.Tensor, backend: str) -
         max_batch_size=4,
     ) as graphs:
         ids = _token_ids(graphs, PROMPTS)
-        expected = _run(graphs, ids)
-        mixed = [ids[0], {"prompt_embeds": table[torch.tensor(ids[1])]}, ids[2]]
-        assert _run(graphs, mixed) == expected
-        assert _run(graphs, ids) == expected
+        mixed_requests = [ids[0], {"prompt_embeds": table[torch.tensor(ids[1])]}, ids[2]]
+        tokens, per_run = [], []
+        for requests in (ids, mixed_requests, ids):
+            passes.clear()
+            tokens.append(_run(graphs, requests))
+            per_run.append(list(passes))
+    assert tokens[1] == tokens[0] and tokens[2] == tokens[0]
+    plain_before, mixed, plain_after = per_run
+    assert any(count for _, count in plain_before)
+    assert any(has_rows for has_rows, _ in mixed)
+    assert all(count == 0 for has_rows, count in mixed if has_rows)
+    assert any(count for _, count in plain_after)
