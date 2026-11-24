@@ -39,7 +39,7 @@ A model accepts prompt embeddings when its class sets `supports_prompt_embeds = 
 
 ## Behaviour
 
-- Rows must equal what the model's input embedding layer would produce, including any scaling it applies. They are copied when the request is submitted.
+- Rows replace the input embedding layer's output at their positions, so they must be in that layer's output space, including any scaling it applies. They are copied when the request is submitted.
 - Placeholder ids still feed repetition penalties and prompt logprobs. A prompt given only as embeddings schedules id 0 at every position.
 - KV cache blocks are reused only across identical ids and rows. With the V2 KV cache manager and no KV connector, blocks before the first row are shared with plain-token prompts; otherwise the whole request is scoped by a salt derived from the rows. KV cache events from the V2 manager report embedding positions as hexadecimal row keys in `token_ids`.
 - Gemma4 per-layer embeddings read the token id after the embedding layer; at embedding positions they see the pad id, so the output can depend on that choice.

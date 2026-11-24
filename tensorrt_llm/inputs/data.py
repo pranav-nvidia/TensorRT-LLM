@@ -95,9 +95,9 @@ class TokensPrompt(TypedDict):
     prompt_embeds: NotRequired[torch.Tensor]
     """Precomputed ``[K, hidden_size]`` input embeddings for ``K`` prompt positions.
 
-    Prototype: the prompt_embeds inputs may change. This is the prompt_embeds contract. Rows (float16, bfloat16 or float32) must
-    equal what the model's input embedding module, including any scaling, would
-    produce; ``generate`` snapshots them at submission. The ids at those
+    Prototype: the prompt_embeds inputs may change. This is the prompt_embeds contract. Rows (float16, bfloat16 or float32)
+    replace the input embedding module's output at their positions, so they must
+    include any scaling that module applies; ``generate`` snapshots them at submission. The ids at those
     positions are placeholders that still feed repetition penalties and prompt
     logprobs; on the V2 KV cache manager, KV cache events report each embedding
     position as a row key rather than its id. KV blocks are reused only across
