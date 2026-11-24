@@ -1323,7 +1323,9 @@ class TestEmbedsParts:
         with pytest.raises(ValueError, match="exceed the"):
             parse_chat_message_content_part(part, mm_tracker)
 
-    @pytest.mark.parametrize("failure", ["limit_same_message", "limit_next_message", "tool_call"])
+    @pytest.mark.parametrize(
+        "failure", ["limit_same_message", "limit_next_message", "tool_call", "registration"]
+    )
     def test_failed_parse_closes_parked_decoders(self, monkeypatch, failure):
         import gc
         import warnings
@@ -1339,14 +1341,18 @@ class TestEmbedsParts:
             messages = [{"role": "user", "content": [part, part]}]
         elif failure == "limit_next_message":
             messages = [{"role": "user", "content": [part]}] * 2
-        else:
+        elif failure == "tool_call":
             tool_call = {"id": "c", "type": "function", "function": {"name": "f", "arguments": "{"}}
             messages = [{"role": "assistant", "content": [part], "tool_calls": [tool_call]}]
+        else:
+            messages = [{"role": "user", "content": [part]}]
+        # A model type with no image placeholder fails to register the part.
+        model_type = "dummy" if failure == "registration" else "qwen2_vl"
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            with pytest.raises(ValueError):
+            with pytest.raises((ValueError, TypeError)):
                 parse_chat_messages_coroutines(
-                    messages, MagicMock(), None, model_type_override="qwen2_vl"
+                    messages, MagicMock(), None, model_type_override=model_type
                 )
             gc.collect()
         decoder.assert_not_called()

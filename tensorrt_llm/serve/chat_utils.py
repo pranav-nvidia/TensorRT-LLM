@@ -636,6 +636,7 @@ def parse_chat_messages_coroutines(
     else:
         content_format = ContentFormat.STRING
 
+    current_media = []
     try:
         for msg in messages:
             # kimi_k3's reference renderer keeps unparsable tool-call argument
@@ -652,6 +653,7 @@ def parse_chat_messages_coroutines(
                 keep_text_parts=native_mistral,
                 raw_tool_call_arguments=native_mistral)
             conversation.append(parsed_msg)
+            current_media = parsed_msg["media"]
 
             # Track placeholders added for this message only.
             msg_placeholder_counts = {}
@@ -677,7 +679,9 @@ def parse_chat_messages_coroutines(
                                   content_format=content_format)
             mm_placeholder_counts.append(msg_placeholder_counts)
     except BaseException:
-        # Nothing will await the loads parked so far.
+        # Nothing will await the loads parked so far, nor this message's loads
+        # that failed to register.
+        close_pending_loads(media["data"] for media in current_media)
         mm_data_tracker.close_pending()
         raise
 
