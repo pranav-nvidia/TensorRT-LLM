@@ -1012,7 +1012,7 @@ def test_qwen_vl_embeddings_with_image_grid_match_processor_path(model, sizes):
     processor, width = _make_qwen_vl_embedding_processor(model, [])
     special_ids = {"<|vision_start|>": 11, "<|image_pad|>": 12, "<|vision_end|>": 13}
 
-    def tokenize(text, return_tensors=None):
+    def tokenize(text: str, return_tensors: Optional[str] = None) -> SimpleNamespace:
         # "Describe" -> 7, special tokens by id, "this image." -> 8.
         pieces = re.findall(r"<\|[a-z_]+\|>|[^<]+", text)
         ids = [special_ids.get(piece, 7 if piece == "Describe" else 8) for piece in pieces]
@@ -1108,7 +1108,7 @@ def test_qwen_vl_embeddings_without_image_grid_raise(model, as_dict):
         ([1, 4.9, 6.9], "must hold integers"),
     ],
 )
-def test_qwen_vl_embeddings_with_wrong_image_grid_raise(grid, match):
+def test_qwen_vl_embeddings_with_wrong_image_grid_raise(grid: list, match: str) -> None:
     processor, width = _make_qwen_vl_embedding_processor("qwen3", [7, 12, 8])
     with pytest.raises(ValueError, match=match):
         processor.attach_multimodal_embeddings(

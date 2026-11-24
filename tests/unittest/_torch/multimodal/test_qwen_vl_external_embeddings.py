@@ -4,6 +4,7 @@
 
 import re
 from types import SimpleNamespace
+from typing import Any, Optional
 
 import pytest
 import torch
@@ -61,7 +62,9 @@ class _FakeTokenizer:
         return 7
 
 
-def _make_processor(cls: type, deepstack_levels: int = 0, tokens_per_second=None):
+def _make_processor(
+    cls: type, deepstack_levels: int = 0, tokens_per_second: Optional[float] = None
+) -> Any:
     """Bare processor with a minimal Qwen config and the fake tokenizer."""
     processor = object.__new__(cls)
     vision_config = SimpleNamespace(
@@ -86,7 +89,9 @@ def _make_processor(cls: type, deepstack_levels: int = 0, tokens_per_second=None
     return processor
 
 
-def _attach(processor, prompt, embeddings, **extra):
+def _attach(
+    processor: Any, prompt: Any, embeddings: dict, **extra: Any
+) -> tuple[list[int], MultimodalParams]:
     """Run the public attach hook and wrap the result as executor params."""
     tokens, extra_inputs = processor.attach_multimodal_embeddings(
         {"prompt": prompt, **extra}, embeddings, SamplingParams()
@@ -94,7 +99,7 @@ def _attach(processor, prompt, embeddings, **extra):
     return tokens, MultimodalParams(**extra_inputs)
 
 
-def _video(t, h, w, width=_HIDDEN, seed=0, **meta):
+def _video(t: int, h: int, w: int, width: int = _HIDDEN, seed: int = 0, **meta: Any) -> dict:
     rows = t * (h // 2) * (w // 2)
     generator = torch.Generator().manual_seed(seed)
     return {
@@ -104,7 +109,7 @@ def _video(t, h, w, width=_HIDDEN, seed=0, **meta):
     }
 
 
-def test_qwen3_video_prompt_has_per_frame_timestamps_and_runs():
+def test_qwen3_video_prompt_has_per_frame_timestamps_and_runs() -> None:
     processor = _make_processor(Qwen3VLInputProcessorBase)
     video = _video(2, 4, 2, timestamps=[0.25, 1.25])
     tokens, params = _attach(
@@ -133,7 +138,7 @@ def test_qwen3_video_prompt_has_per_frame_timestamps_and_runs():
     assert mrope["mrope_position_deltas"].tolist() == [[0]]
 
 
-def test_qwen3_timestamps_from_fps_and_frame_indices_match_hf():
+def test_qwen3_timestamps_from_fps_and_frame_indices_match_hf() -> None:
     from transformers.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
 
     processor = _make_processor(Qwen3VLInputProcessorBase)
@@ -145,7 +150,7 @@ def test_qwen3_timestamps_from_fps_and_frame_indices_match_hf():
     assert processor._resolve_external_video_metadata(item)["timestamps"] == hf
 
 
-def test_mixed_image_and_video_follow_prompt_order():
+def test_mixed_image_and_video_follow_prompt_order() -> None:
     processor = _make_processor(Qwen3VLInputProcessorBase, deepstack_levels=1)
     width = 2 * _HIDDEN
     image = {"mm_embeddings": torch.ones(2, width), "image_grid_thw": [1, 2, 4]}
@@ -172,7 +177,7 @@ def test_mixed_image_and_video_follow_prompt_order():
     assert embeddings[0] is video["mm_embeddings"] and embeddings[1] is image["mm_embeddings"]
 
 
-def test_mixed_bare_and_framed_video_placeholders_are_rejected():
+def test_mixed_bare_and_framed_video_placeholders_are_rejected() -> None:
     processor = _make_processor(Qwen3VLInputProcessorBase)
     videos = [_video(1, 2, 2, timestamps=[0.0]), _video(1, 2, 2, timestamps=[1.0])]
     with pytest.raises(ValueError, match="framed"):
@@ -183,7 +188,7 @@ def test_mixed_bare_and_framed_video_placeholders_are_rejected():
         )
 
 
-def test_non_square_image_grid_drives_mrope():
+def test_non_square_image_grid_drives_mrope() -> None:
     processor = _make_processor(Qwen3VLInputProcessorBase)
     image = {"mm_embeddings": torch.ones(2, _HIDDEN), "image_grid_thw": [1, 2, 4]}
     tokens, params = _attach(
@@ -194,7 +199,7 @@ def test_non_square_image_grid_drives_mrope():
     assert mrope[:, 0, 1:3].tolist() == [[1, 1], [1, 1], [1, 2]]
 
 
-def test_qwen3_5_config_takes_hidden_size_rows():
+def test_qwen3_5_config_takes_hidden_size_rows() -> None:
     """Qwen3.5 vision configs have no deepstack levels, so rows are hidden-size wide."""
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 
@@ -218,13 +223,13 @@ def test_qwen3_5_config_takes_hidden_size_rows():
         _attach(processor, prompt, {"image": [wide]})
 
 
-def test_bare_image_tensor_needs_a_grid():
+def test_bare_image_tensor_needs_a_grid() -> None:
     processor = _make_processor(Qwen3VLInputProcessorBase)
     with pytest.raises(ValueError, match="requires 'image_grid_thw'"):
         _attach(processor, "<|image_pad|>", {"image": torch.ones(4, _HIDDEN)})
 
 
-def test_qwen2_5_video_scales_time_by_second_per_grid():
+def test_qwen2_5_video_scales_time_by_second_per_grid() -> None:
     processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
     video = _video(2, 2, 2, fps=1.0)  # second_per_grid_ts = temporal_patch_size / fps = 2
     tokens, params = _attach(
@@ -244,13 +249,13 @@ def test_qwen2_5_video_scales_time_by_second_per_grid():
         ({"timestamps": [0.0, 1.0]}, "not 'timestamps'"),
     ],
 )
-def test_qwen2_5_video_requires_one_time_scale(timing, match):
+def test_qwen2_5_video_requires_one_time_scale(timing: dict, match: str) -> None:
     processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
     with pytest.raises(ValueError, match=match):
         _attach(processor, "<|video_pad|>", {"video": [_video(2, 2, 2, **timing)]})
 
 
-def _attach_framed_video(processor, video: dict) -> tuple:
+def _attach_framed_video(processor: Any, video: dict) -> tuple:
     """Attach one framed video."""
     return processor.attach_multimodal_embeddings(
         {"prompt": "<|vision_start|><|video_pad|><|vision_end|>"},
@@ -263,7 +268,7 @@ def _attach_framed_video(processor, video: dict) -> tuple:
     "timing, match",
     [({"second_per_grid_ts": 1e5}, "positions exceed"), ({"fps": 1e-300}, "overflows float32")],
 )
-def test_qwen2_5_video_positions_past_rotary_table_are_rejected(timing, match):
+def test_qwen2_5_video_positions_past_rotary_table_are_rejected(timing: dict, match: str) -> None:
     processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
     with pytest.raises(ValueError, match=match):
         _attach_framed_video(processor, _video(8, 2, 2, **timing))
@@ -295,7 +300,7 @@ def _admitted(
     return request
 
 
-def test_qwen2_5_video_decoding_is_capped_at_admission():
+def test_qwen2_5_video_decoding_is_capped_at_admission() -> None:
     processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
     # The last video position is 1 + 7 * 9141 * 2 = 127975, below 128000.
     tokens, extra = _attach_framed_video(processor, _video(8, 2, 2, second_per_grid_ts=9141.0))
@@ -308,7 +313,7 @@ def test_qwen2_5_video_decoding_is_capped_at_admission():
     assert _admitted(trailing, 10, 10**6).max_new_tokens == 10**6
 
 
-def test_mrope_decode_cap_counts_forwarded_positions():
+def test_mrope_decode_cap_counts_forwarded_positions() -> None:
     # Prompt positions 0..99 shifted by 32667 end at 32766; the last sampled token is not
     # forwarded, so two new tokens write only position 32767.
     deltas = {"mrope_position_deltas": torch.tensor([[32667]], dtype=torch.int32)}
@@ -320,7 +325,7 @@ def test_mrope_decode_cap_counts_forwarded_positions():
         _admitted(deltas, 100, 10, draft_tokens=2, max_positions=32768)
 
 
-def test_qwen2_5_video_without_max_tokens_is_capped_not_rejected():
+def test_qwen2_5_video_without_max_tokens_is_capped_not_rejected() -> None:
     processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
     # trtllm-serve leaves max_tokens unset; the worker then fills max_seq_len - prompt_len.
     tokens, extra = processor.attach_multimodal_embeddings(
@@ -333,13 +338,13 @@ def test_qwen2_5_video_without_max_tokens_is_capped_not_rejected():
 
 
 @pytest.mark.parametrize("timestamps", [[0.0, 1e308], [-1.0, 0.0]])
-def test_qwen3_out_of_range_timestamps_are_rejected(timestamps):
+def test_qwen3_out_of_range_timestamps_are_rejected(timestamps: list[float]) -> None:
     processor = _make_processor(Qwen3VLInputProcessorBase)
     with pytest.raises(ValueError, match=r"\[0, 1e6\] seconds"):
         _attach_framed_video(processor, _video(2, 4, 2, timestamps=timestamps))
 
 
-def test_qwen2_5_bare_video_placeholder_is_rejected():
+def test_qwen2_5_bare_video_placeholder_is_rejected() -> None:
     processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
     with pytest.raises(ValueError, match="framed"):
         _attach(processor, "<|video_pad|>", {"video": [_video(2, 2, 2, fps=2.0)]})
@@ -402,26 +407,28 @@ def test_qwen2_5_bare_video_placeholder_is_rejected():
         ),
     ],
 )
-def test_invalid_embeddings_are_rejected(embeddings, prompt, match):
+def test_invalid_embeddings_are_rejected(embeddings: dict, prompt: str, match: str) -> None:
     processor = _make_processor(Qwen3VLInputProcessorBase)
     with pytest.raises((ValueError, TypeError), match=match):
         _attach(processor, prompt, embeddings)
 
 
-def _hashes(processor, prompt, embeddings, **extra):
+def _hashes(
+    processor: Any, prompt: Any, embeddings: dict, **extra: Any
+) -> tuple[list[int], list[list[int]]]:
     """Prompt tokens and per-item cache keys of one attached request."""
     tokens, params = _attach(processor, prompt, embeddings, **extra)
     return tokens, params.multimodal_input.multimodal_hashes
 
 
-def test_position_metadata_joins_the_cache_key():
+def test_position_metadata_joins_the_cache_key() -> None:
     """Same rows and prompt tokens but different video timing never share KV."""
     rows = torch.ones(4, _HIDDEN)
     qwen3 = _make_processor(Qwen3VLInputProcessorBase)
     video = "<|vision_start|><|video_pad|><|vision_end|>"
     qwen2_5 = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
 
-    def clip(**timing):
+    def clip(**timing: float | list[float]) -> dict:
         return {"video": [{"mm_embeddings": rows, "video_grid_thw": [2, 2, 4], **timing}]}
 
     slow = _hashes(qwen2_5, video, clip(fps=1.0))
@@ -435,7 +442,7 @@ def test_position_metadata_joins_the_cache_key():
     assert early[0] != late[0]
 
 
-def test_uuids_of_absent_modalities_are_ignored():
+def test_uuids_of_absent_modalities_are_ignored() -> None:
     processor = _make_processor(Qwen3VLInputProcessorBase)
     prompt = "<|vision_start|><|image_pad|><|vision_end|>"
     image = {"image": [{"mm_embeddings": torch.ones(4, _HIDDEN), "image_grid_thw": [1, 4, 4]}]}
@@ -445,7 +452,7 @@ def test_uuids_of_absent_modalities_are_ignored():
     assert other == plain
 
 
-def test_llm_preprocess_carries_hashes_and_uuids_from_token_ids():
+def test_llm_preprocess_carries_hashes_and_uuids_from_token_ids() -> None:
     processor = _make_processor(Qwen3VLInputProcessorBase)
     llm = object.__new__(BaseLLM)
     llm.input_processor = processor

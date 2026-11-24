@@ -36,8 +36,8 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.inputs import TextPrompt, default_multimodal_input_loader
 from tensorrt_llm.inputs.multimodal import apply_mm_hashes
 from tensorrt_llm.inputs.multimodal_data import VideoData
-from tensorrt_llm.llmapi import (CacheTransceiverConfig, DisaggregatedParams,
-                                 KvCacheConfig)
+from tensorrt_llm.llmapi import (CacheTransceiverConfig, CompletionOutput,
+                                 DisaggregatedParams, KvCacheConfig)
 from tensorrt_llm.llmapi.llm import LLM, SamplingParams
 
 test_data_root = Path(
@@ -1009,7 +1009,7 @@ def test_video_encoder_handoff_preserves_timestamps(llms_and_encoder,
     assert output.outputs[0].token_ids == reference.outputs[0].token_ids
 
 
-def _synthetic_videos(frame_counts) -> list[VideoData]:
+def _synthetic_videos(frame_counts: tuple[int, ...]) -> list[VideoData]:
     """Red-then-blue clips sampled from a 240-frame, 24 fps source."""
     videos = []
     for count in frame_counts:
@@ -1125,8 +1125,9 @@ def _raw_video_grids(llm: LLM, inputs: dict) -> tuple[torch.Tensor, object]:
 @pytest.mark.parametrize("pd_disagg", [False], indirect=True)
 @pytest.mark.parametrize("frame_counts", [(8, ), (8, 12)])
 @pytest.mark.threadleak(enabled=False)
-def test_external_video_embeddings_match_raw_video(llms_and_encoder,
-                                                   frame_counts):
+def test_external_video_embeddings_match_raw_video(
+        llms_and_encoder: tuple[tuple[LLM, LLM | None], MultimodalEncoder],
+        frame_counts: tuple[int, ...]) -> None:
     """Precomputed video embeddings + metadata reproduce the raw-video request."""
     (llm, _), encoder = llms_and_encoder
     videos = _synthetic_videos(frame_counts)
@@ -1141,7 +1142,7 @@ def test_external_video_embeddings_match_raw_video(llms_and_encoder,
     assert output.outputs[0].token_ids == reference.outputs[0].token_ids
 
 
-def _greedy_tokens_before_first_tie(output,
+def _greedy_tokens_before_first_tie(output: CompletionOutput,
                                     min_margin: float = 0.25) -> list[int]:
     """Greedy tokens generated before the first top-2 logprob near-tie."""
     tokens = []
@@ -1191,7 +1192,8 @@ def no_overlap_llm(model_dir: Path) -> Generator[LLM, None, None]:
 @pytest.mark.parametrize("pd_disagg", [False], indirect=True)
 @pytest.mark.threadleak(enabled=False)
 def test_external_video_embeddings_without_overlap_scheduler(
-        llms_and_encoder, no_overlap_llm):
+        llms_and_encoder: tuple[tuple[LLM, LLM | None], MultimodalEncoder],
+        no_overlap_llm: LLM) -> None:
     """Attached video matches raw video and replays from cache without overlap."""
     (llm, _), encoder = llms_and_encoder
     inputs = _video_inputs(llm, _synthetic_videos((8, 12)))
@@ -1220,7 +1222,8 @@ def test_external_video_embeddings_without_overlap_scheduler(
 @pytest.mark.parametrize("pd_disagg", [False], indirect=True)
 @pytest.mark.threadleak(enabled=False)
 def test_external_video_embeddings_chunked_prefill_and_reuse(
-        llms_and_encoder, chunked_reuse_llm):
+        llms_and_encoder: tuple[tuple[LLM, LLM | None], MultimodalEncoder],
+        chunked_reuse_llm: LLM) -> None:
     """Chunked prefill and KV reuse key attached video by content.
 
     Small chunks split frame groups; a replay reuses the cached prompt; a
