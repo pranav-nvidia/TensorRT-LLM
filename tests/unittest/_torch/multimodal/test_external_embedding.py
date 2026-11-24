@@ -269,14 +269,8 @@ def test_qwen3_vl_attached_embedding_grid_joins_its_hash() -> None:
     config = _make_qwen3_vl_config(hidden_size)
     embedding_width = hidden_size * (
         1 + len(config.vision_config.deepstack_visual_indexes))
-    processor = _make_qwen3_vl_processor(
-        config,
-        _make_tokenizer([
-            7,
-            config.vision_start_token_id,
-            config.image_token_id,
-            config.vision_end_token_id,
-        ]))
+    processor = _make_qwen3_vl_processor(config,
+                                         _PromptTokenizer(config, text_id=7))
     embedding = torch.zeros(4, embedding_width)
     inputs = {
         "prompt": "Describe.<|vision_start|><|image_pad|><|vision_end|>",

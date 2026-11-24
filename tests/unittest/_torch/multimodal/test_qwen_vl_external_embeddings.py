@@ -311,8 +311,16 @@ def test_qwen2_5_bare_video_placeholder_is_rejected():
         ),
         ({"video": [{"mm_embeddings": torch.ones(4, _HIDDEN)}]}, "<|video_pad|>", "video_grid_thw"),
         ({"image": [torch.ones(4, _HIDDEN + 1)]}, "<|image_pad|>", "width"),
-        ({"image": [torch.ones(4, _HIDDEN)]}, "no placeholder", "0 image placeholders"),
-        ({"image": [torch.ones(4, _HIDDEN)]}, "<|image_pad|><|image_pad|>", "more image"),
+        (
+            {"image": [{"mm_embeddings": torch.ones(4, _HIDDEN), "image_grid_thw": [1, 4, 4]}]},
+            "no placeholder",
+            "0 image placeholders",
+        ),
+        (
+            {"image": [{"mm_embeddings": torch.ones(4, _HIDDEN), "image_grid_thw": [1, 4, 4]}]},
+            "<|image_pad|><|image_pad|>",
+            "more image",
+        ),
         ({"image": [torch.ones(4, _HIDDEN, dtype=torch.int32)]}, "<|image_pad|>", "floating"),
         ({"audio": [torch.ones(4, _HIDDEN)]}, "<|image_pad|>", "Unsupported modalities"),
         (
