@@ -8,7 +8,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2_5VLInputProcessorBase
+from tensorrt_llm._torch.models.modeling_qwen2vl import (
+    Qwen2_5VLInputProcessorBase,
+    cap_mrope_decode_tokens,
+)
 from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLInputProcessorBase
 from tensorrt_llm.inputs.external_embeddings import ExternalEmbeddingItem
 from tensorrt_llm.inputs.multimodal import MultimodalParams
@@ -245,12 +248,12 @@ def test_qwen2_5_video_requires_one_time_scale(timing, match):
         _attach(processor, "<|video_pad|>", {"video": [_video(2, 2, 2, **timing)]})
 
 
-def _attach_framed_video(processor, video: dict, max_tokens: int) -> tuple:
-    """Attach one framed video with a given generation length."""
+def _attach_framed_video(processor, video: dict) -> tuple:
+    """Attach one framed video."""
     return processor.attach_multimodal_embeddings(
         {"prompt": "<|vision_start|><|video_pad|><|vision_end|>"},
         {"video": [video]},
-        SamplingParams(max_tokens=max_tokens),
+        SamplingParams(),
     )
 
 
@@ -261,31 +264,44 @@ def _attach_framed_video(processor, video: dict, max_tokens: int) -> tuple:
 def test_qwen2_5_video_positions_past_rotary_table_are_rejected(timing, match):
     processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
     with pytest.raises(ValueError, match=match):
-        _attach_framed_video(processor, _video(8, 2, 2, **timing), max_tokens=1)
+        _attach_framed_video(processor, _video(8, 2, 2, **timing))
 
 
-@pytest.mark.parametrize("max_tokens", [32, None])
-def test_qwen2_5_video_decode_positions_stay_in_rotary_table(max_tokens):
+def _admitted(mrope_config: dict, prompt_len: int, max_new_tokens: int) -> SimpleNamespace:
+    """A request as admission sees it, after cap_mrope_decode_tokens."""
+    request = SimpleNamespace(
+        py_multimodal_data={"mrope_config": mrope_config},
+        orig_prompt_len=prompt_len,
+        max_new_tokens=max_new_tokens,
+        py_max_new_tokens=max_new_tokens,
+    )
+    cap_mrope_decode_tokens(
+        request, _make_processor(Qwen2_5VLInputProcessorBase).config.text_config
+    )
+    return request
+
+
+def test_qwen2_5_video_decoding_is_capped_at_admission():
     processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
     # The last video position is 1 + 7 * 9141 * 2 = 127975, below 128000.
-    video = _video(8, 2, 2, second_per_grid_ts=9141.0)
-    _attach_framed_video(processor, video, max_tokens=1)
-    with pytest.raises(ValueError, match="set max_tokens to at most 23$"):
-        _attach_framed_video(processor, video, max_tokens=max_tokens)
-
-
-def test_qwen2_5_decode_bound_clamps_max_tokens_to_context():
-    processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
-    # Positions trail the token count, so any max_tokens fits once clamped.
-    video = _video(2, 8, 8, second_per_grid_ts=1.0)
-    _attach_framed_video(processor, video, max_tokens=10**9)
+    tokens, extra = _attach_framed_video(processor, _video(8, 2, 2, second_per_grid_ts=9141.0))
+    mrope_config = extra["multimodal_data"]["mrope_config"]
+    capped = _admitted(mrope_config, len(tokens), 128000 - len(tokens))
+    assert capped.max_new_tokens == capped.py_max_new_tokens == 23
+    assert _admitted(mrope_config, len(tokens), 5).py_max_new_tokens == 5
+    # Positions that trail the token count leave max_seq_len as the only limit.
+    assert _admitted(
+        {"mrope_position_deltas": torch.tensor([[-50]])}, 10, 10**6
+    ).max_new_tokens == (10**6)
+    with pytest.raises(ValueError, match="start past"):
+        _admitted({"mrope_position_deltas": torch.tensor([[127990]])}, 10, 1)
 
 
 @pytest.mark.parametrize("timestamps", [[0.0, 1e308], [-1.0, 0.0]])
 def test_qwen3_out_of_range_timestamps_are_rejected(timestamps):
     processor = _make_processor(Qwen3VLInputProcessorBase)
     with pytest.raises(ValueError, match=r"\[0, 1e6\] seconds"):
-        _attach_framed_video(processor, _video(2, 4, 2, timestamps=timestamps), max_tokens=1)
+        _attach_framed_video(processor, _video(2, 4, 2, timestamps=timestamps))
 
 
 def test_qwen2_5_bare_video_placeholder_is_rejected():

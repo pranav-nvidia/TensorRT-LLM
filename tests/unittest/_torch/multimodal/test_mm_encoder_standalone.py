@@ -1103,12 +1103,11 @@ def _raw_video_grids(llm: LLM, inputs: dict) -> tuple[torch.Tensor, object]:
                 image_grid_thw: Optional[torch.Tensor],
                 video_grid_thw: Optional[torch.Tensor],
                 attention_mask: Optional[torch.Tensor],
-                second_per_grid_ts: Optional[torch.Tensor] = None,
-                max_tokens: Optional[int] = None) -> dict:
+                second_per_grid_ts: Optional[torch.Tensor] = None) -> dict:
         captured.update(video_grid_thw=video_grid_thw,
                         second_per_grid_ts=second_per_grid_ts)
         return get_mrope_config(input_ids, image_grid_thw, video_grid_thw,
-                                attention_mask, second_per_grid_ts, max_tokens)
+                                attention_mask, second_per_grid_ts)
 
     processor.get_mrope_config = capture
     try:
