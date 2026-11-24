@@ -359,8 +359,8 @@ def _align_gap(
 
     ``framed``: an item starts at ``end`` and framing inserted before it may
     merge with the last text tokens, so the segment matches from both ends.
-    Tokens matched from the end after framing was inserted are ``_AMBIGUOUS``:
-    the framing can contain their id.
+    Once the head stops matching, framing changed the gap, so tokens matched from
+    the end are ``_AMBIGUOUS``: the framing can contain their id.
     """
     n = len(segment)
     head = 0
@@ -378,7 +378,7 @@ def _align_gap(
     ):
         tail += 1
     tail_positions = list(range(end - tail, end))
-    if head < n and end - begin > n:
+    if head < n:
         tail_positions = [_AMBIGUOUS] * tail
     return list(range(begin, begin + head)) + [-1] * (n - head - tail) + tail_positions
 

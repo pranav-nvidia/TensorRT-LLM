@@ -240,6 +240,10 @@ def test_remap_text_merged_with_framing() -> None:
     _, tag = build_prompt_embeds(original, _rows(1), [False, False, True] + [False] * 4)
     with pytest.raises(ValueError, match="ambiguous"):
         remap_prompt_embeds(tag, original, closing, [(6, 8)])
+    # Framing that merges without growing the gap: "7" and "<" become 62, the timestamp ends in 2.
+    same_length = [1, 62, 2, 50, 53, 53, 52, 3]
+    with pytest.raises(ValueError, match="ambiguous"):
+        remap_prompt_embeds(tag, original, same_length, [(4, 6)])
 
 
 def test_remap_text_after_video_matching_timestamp() -> None:

@@ -538,7 +538,8 @@ def test_cancel_releases_worker_rows(monkeypatch: pytest.MonkeyPatch) -> None:
                 outputs = [output async for output in result]
                 assert outputs[-1].outputs[0].finish_reason == "cancelled"
 
-        asyncio.run(run())
+        # A cancellation that never ends the streams fails here instead of hanging.
+        asyncio.run(asyncio.wait_for(run(), timeout=300))
         assert len(owned_rows) == 2
         # A later request runs to completion, so the executor has moved past both.
         assert llm.generate(ids, _greedy()).outputs[0].token_ids
