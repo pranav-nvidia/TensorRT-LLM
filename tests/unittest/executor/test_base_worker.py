@@ -1117,3 +1117,74 @@ def test_prompt_embeds_float16_range(dtype: torch.dtype, value: float,
     else:
         with pytest.raises(RequestError, match="float16 range"):
             BaseWorker._check_prompt_embeds(worker, request)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("request_type", ["context_only", "generation_only"])
+@pytest.mark.parametrize("v2", [True, False], ids=["v2", "v1"])
+def test_prompt_embeds_disaggregated_deployment_checks(request_type: str,
+                                                       v2: bool) -> None:
+    # Both roles pass the full checks; the V1 transceiver cannot key blocks by rows.
+    # The generation role holds only the identity of float32 rows for a float16 model.
+    from tensorrt_llm.disaggregated_params import DisaggregatedParams
+    from tensorrt_llm.inputs.prompt_embeds import build_prompt_embeds
+
+    _, pe = build_prompt_embeds([1, 2, 3], torch.ones(3, 4))
+    request = GenerationRequest(
+        [1, 2, 3],
+        SamplingParams(max_tokens=1),
+        prompt_embeds=pe.identity_only()
+        if request_type == "generation_only" else pe,
+        disaggregated_params=DisaggregatedParams(request_type=request_type),
+    )
+    worker = _prompt_embeds_worker("float16", keys_rows=v2)
+    if v2:
+        BaseWorker._check_prompt_embeds(worker, request)
+    else:
+        with pytest.raises(RequestError, match="use_kv_cache_manager_v2"):
+            BaseWorker._check_prompt_embeds(worker, request)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "v2, connector, keys_rows",
+    [(True, None, True), (False, None, False), (True, object(), False)],
+    ids=["v2", "v1", "v2_connector"],
+)
+def test_prompt_embeds_cache_salt(v2: bool, connector: object | None,
+                                  keys_rows: bool) -> None:
+    # Where blocks are keyed by ids alone (V1, external KV stores) the salt scopes the prompt.
+    import pickle
+
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+        KVCacheManagerV2
+    from tensorrt_llm.inputs.prompt_embeds import (build_prompt_embeds,
+                                                   prompt_embeds_cache_salt)
+
+    _, pe = build_prompt_embeds([1, 2, 3], torch.ones(3, 4))
+    params = SamplingParams(max_tokens=1)
+    worker = SimpleNamespace(
+        llm_args=SimpleNamespace(kv_connector_config=connector),
+        _cache_manager_keys_rows=lambda: v2,
+    )
+    worker._kv_cache_keys_prompt_embeds = lambda: BaseWorker._kv_cache_keys_prompt_embeds(
+        worker)
+    plain = GenerationRequest([1, 2, 3], params, cache_salt="s")
+    embeds = GenerationRequest([1, 2, 3],
+                               params,
+                               cache_salt="s",
+                               prompt_embeds=pe)
+    assert embeds.cache_salt == "s"
+    assert BaseWorker._effective_cache_salt(worker, plain) == "s"
+    salt = BaseWorker._effective_cache_salt(worker, embeds)
+    assert salt == ("s" if keys_rows else prompt_embeds_cache_salt(
+        "s", pe.digest))
+    assert KVCacheManagerV2.keys_prompt_embeds_rows
+    # A plain request cannot claim the derived salt of an embedding request.
+    derived = prompt_embeds_cache_salt("s", pe.digest)
+    claimed = GenerationRequest([1, 2, 3], params, cache_salt=derived)
+    assert BaseWorker._effective_cache_salt(worker,
+                                            claimed) not in (derived, None)
+    restored = pickle.loads(pickle.dumps(embeds))
+    assert torch.equal(restored.prompt_embeds.embeds, pe.embeds)
+    assert restored.prompt_embeds.row_digests == pe.row_digests
