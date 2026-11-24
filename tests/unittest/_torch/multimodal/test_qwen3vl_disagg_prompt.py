@@ -283,7 +283,11 @@ def test_external_embeddings_reuse_common_item_metadata(model):
     ]
 
     result, extra = processor.attach_multimodal_embeddings(
-        {"prompt": "<|image_pad|> and <|image_pad|>"}, {"image": items}, SamplingParams()
+        {
+            "prompt": "<|vision_start|><|image_pad|><|vision_end|> and <|vision_start|><|image_pad|><|vision_end|>"
+        },
+        {"image": items},
+        SamplingParams(),
     )
     params = MultimodalParams(**extra)
 

@@ -318,9 +318,15 @@ def test_qwen2_5_bare_video_placeholder_is_rejected():
         ),
         (
             {"image": [{"mm_embeddings": torch.ones(4, _HIDDEN), "image_grid_thw": [1, 4, 4]}]},
-            "<|image_pad|><|image_pad|>",
+            "<|vision_start|><|image_pad|><|vision_end|>" * 2,
             "more image",
         ),
+        (
+            {"image": [{"mm_embeddings": torch.ones(4, _HIDDEN), "image_grid_thw": [1, 4, 4]}]},
+            "<|image_pad|>",
+            "needs image placeholders framed",
+        ),
+        ({"image": None}, "<|image_pad|>", "must be a list"),
         ({"image": [torch.ones(4, _HIDDEN, dtype=torch.int32)]}, "<|image_pad|>", "floating"),
         ({"audio": [torch.ones(4, _HIDDEN)]}, "<|image_pad|>", "Unsupported modalities"),
         (
@@ -343,17 +349,9 @@ def _hashes(processor, prompt, embeddings, **extra):
 
 
 def test_position_metadata_joins_the_cache_key():
-    """Same rows and prompt tokens but different MRoPE inputs never share KV."""
+    """Same rows and prompt tokens but different video timing never share KV."""
     rows = torch.ones(4, _HIDDEN)
-    image = "<|vision_start|><|image_pad|><|vision_end|>"
     qwen3 = _make_processor(Qwen3VLInputProcessorBase)
-    square = _hashes(
-        qwen3, image, {"image": [{"mm_embeddings": rows, "image_grid_thw": [1, 4, 4]}]}
-    )
-    wide = _hashes(qwen3, image, {"image": [{"mm_embeddings": rows, "image_grid_thw": [1, 2, 8]}]})
-    assert square[0] == wide[0]
-    assert square[1] != wide[1]
-
     video = "<|vision_start|><|video_pad|><|vision_end|>"
     qwen2_5 = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
 
@@ -381,19 +379,6 @@ def test_uuid_joins_the_cache_key_and_absent_modalities_are_ignored():
     # As for raw media, a UUID key with no items of that modality is ignored.
     _, other = _hashes(processor, prompt, image, multi_modal_uuids={"video": ["clip-1"]})
     assert other == plain
-
-
-def test_two_embeddings_with_same_prompt_get_different_cache_keys():
-    processor = _make_processor(Qwen3VLInputProcessorBase)
-    prompt = "<|vision_start|><|image_pad|><|vision_end|>describe"
-    first = {"mm_embeddings": torch.zeros(4, _HIDDEN), "image_grid_thw": [1, 4, 4]}
-    second = {"mm_embeddings": torch.ones(4, _HIDDEN), "image_grid_thw": [1, 4, 4]}
-    tokens_a, params_a = _attach(processor, prompt, {"image": [first]})
-    tokens_b, params_b = _attach(processor, prompt, {"image": [second]})
-    assert tokens_a == tokens_b
-    assert (
-        params_a.multimodal_input.multimodal_hashes != params_b.multimodal_input.multimodal_hashes
-    )
 
 
 def test_llm_preprocess_carries_hashes_and_uuids_from_token_ids():

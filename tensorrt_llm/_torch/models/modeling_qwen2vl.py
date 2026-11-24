@@ -1487,6 +1487,14 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             item_refs.append((modality, index))
             pieces.append(text_prompt[last_end:match.start()])
             if modality == "image":
+                # MRoPE gives image positions only to pads that follow vision
+                # start, so an unframed image would get text positions.
+                if not (text_prompt.endswith(self._VISION_START, 0,
+                                             match.start()) and
+                        text_prompt.startswith(self._VISION_END, match.end())):
+                    raise ValueError(
+                        f"{type(self).__name__} needs image placeholders "
+                        "framed as <|vision_start|><|image_pad|><|vision_end|>")
                 pieces.append(self._IMAGE_PAD * item.num_rows)
             else:
                 pieces.append(
