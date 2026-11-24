@@ -234,7 +234,7 @@ class RpcWorkerMixin:
         except RequestError as e:
             logger.error(f"submit request failed: {e}")
             self._await_response_helper.temp_error_responses.put(
-                ErrorResponse(request.id, e, request.id)
+                ErrorResponse(request.id, str(e), request.id)
             )
 
     def fetch_responses(self, timeout: Optional[float] = None) -> list:
