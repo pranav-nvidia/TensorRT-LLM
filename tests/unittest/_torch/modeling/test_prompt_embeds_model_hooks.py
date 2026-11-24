@@ -5,6 +5,7 @@ input embedding treat an embedding row like one of their image positions."""
 
 from types import SimpleNamespace
 from typing import Literal
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -12,10 +13,13 @@ import torch
 from tensorrt_llm._torch.models._arch_index import MODEL_ARCH_TO_MODULE
 from tensorrt_llm._torch.models.modeling_exaone4_5 import Exaone4_5_ForConditionalGeneration
 from tensorrt_llm._torch.models.modeling_gemma4 import Gemma4AssistantForCausalLM, Gemma4ForCausalLM
+from tensorrt_llm._torch.models.modeling_llama import Llama4ForConditionalGeneration
 from tensorrt_llm._torch.models.modeling_minimaxm3 import MiniMaxM3VLForConditionalGeneration
+from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VLModelBase
 from tensorrt_llm._torch.models.modeling_speculative import (
     Eagle3ForCausalLM,
     MistralLarge3EagleForCausalLM,
+    SpecDecOneEngineForCausalLM,
 )
 from tensorrt_llm._torch.models.modeling_utils import (
     DecoderModelForCausalLM,
@@ -60,6 +64,64 @@ def test_gemma4(
     assert (extra["ple_input_ids"].tolist() if extra else None) == ple_ids
     # Plain rows keep their ids, so plain requests batched alongside are unaffected.
     assert IDS.tolist() == [11, 0, 0, 14, 0]
+
+
+@pytest.mark.parametrize("llm_reason", [None, "it reads token ids"])
+def test_qwen3_vl_refuses_what_its_language_model_refuses(llm_reason: str | None) -> None:
+    llm = SimpleNamespace(
+        supports_prompt_embeds=True, prompt_embeds_config_unsupported_reason=lambda: llm_reason
+    )
+    wrapper = SimpleNamespace(llm=llm)
+    assert Qwen3VLModelBase.prompt_embeds_config_unsupported_reason(wrapper) == llm_reason
+
+
+@pytest.mark.parametrize(
+    "mm_token_indices, error",
+    [
+        (torch.tensor([1, 2]), None),
+        (None, "need mm_token_indices"),
+        (torch.tensor([1]), "token count mismatch"),
+    ],
+    ids=["overlay", "no_indices", "count_mismatch"],
+)
+def test_llama4_image_rows_over_prompt_embeds(
+    mm_token_indices: torch.Tensor | None, error: str | None
+) -> None:
+    # Supplied embeddings already hold the text rows; image features overwrite their rows.
+    model = object.__new__(Llama4ForConditionalGeneration)
+    image = torch.full((2, 4), 5.0)
+    object.__setattr__(model, "mm_encoder", SimpleNamespace(forward=lambda params: [image]))
+    inputs_embeds = torch.zeros(4, 4)
+
+    def language_model(
+        self: object,
+        attn_metadata: None,
+        input_ids: None,
+        position_ids: None,
+        inputs_embeds: torch.Tensor,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        return inputs_embeds
+
+    with patch.object(SpecDecOneEngineForCausalLM, "forward", language_model):
+
+        def forward() -> torch.Tensor:
+            return Llama4ForConditionalGeneration.forward(
+                model,
+                None,
+                None,
+                None,
+                inputs_embeds,
+                multimodal_params=[object()],
+                mm_token_indices=mm_token_indices,
+            )
+
+        if error is not None:
+            with pytest.raises(ValueError, match=error):
+                forward()
+            return
+        out = forward()
+    assert out[[1, 2]].eq(5.0).all() and out[[0, 3]].eq(0.0).all()
 
 
 @pytest.mark.parametrize(

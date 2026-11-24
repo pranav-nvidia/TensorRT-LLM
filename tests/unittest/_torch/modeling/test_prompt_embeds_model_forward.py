@@ -31,31 +31,31 @@ def _gemma4_context_logits(
     kv_cache_manager = gemma4_tests._build_gemma4_kv_cache_manager(
         config, num_blocks=2, batch_size=len(seq_lens)
     )
-    request_ids = list(range(1, len(seq_lens) + 1))
-    kv_cache_manager.add_dummy_requests(request_ids, seq_lens)
-    positions = torch.cat([torch.arange(n, dtype=torch.int32) for n in seq_lens]).cuda()
-    attn_metadata = get_attention_backend("FLASHINFER").Metadata(
-        seq_lens=torch.tensor(seq_lens, dtype=torch.int),
-        num_contexts=len(seq_lens),
-        kv_cache_params=KVCacheParams(
-            use_cache=True, num_cached_tokens_per_seq=[0] * len(seq_lens)
-        ),
-        max_num_requests=len(seq_lens),
-        max_num_tokens=8192,
-        kv_cache_manager=kv_cache_manager,
-        request_ids=request_ids,
-        prompt_lens=seq_lens,
-    )
-    with torch.inference_mode():
-        attn_metadata.prepare()
-        try:
+    try:
+        request_ids = list(range(1, len(seq_lens) + 1))
+        kv_cache_manager.add_dummy_requests(request_ids, seq_lens)
+        positions = torch.cat([torch.arange(n, dtype=torch.int32) for n in seq_lens]).cuda()
+        attn_metadata = get_attention_backend("FLASHINFER").Metadata(
+            seq_lens=torch.tensor(seq_lens, dtype=torch.int),
+            num_contexts=len(seq_lens),
+            kv_cache_params=KVCacheParams(
+                use_cache=True, num_cached_tokens_per_seq=[0] * len(seq_lens)
+            ),
+            max_num_requests=len(seq_lens),
+            max_num_tokens=8192,
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            prompt_lens=seq_lens,
+        )
+        with torch.inference_mode():
+            attn_metadata.prepare()
             return model.forward(
                 position_ids=positions.unsqueeze(0),
                 attn_metadata=attn_metadata,
                 **_forward_inputs(model, input_ids, embed_rows, ple_input_ids),
             ).float()
-        finally:
-            kv_cache_manager.shutdown()
+    finally:
+        kv_cache_manager.shutdown()
 
 
 def _forward_inputs(
