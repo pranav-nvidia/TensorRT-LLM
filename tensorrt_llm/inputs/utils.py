@@ -101,6 +101,9 @@ _ZIP_EOCD = struct.Struct("<4s4x2H2IH")
 _ZIP64_EOCD = struct.Struct("<4s36xQQ")
 _ZIP64_LOCATOR = struct.Struct("<4s4xQ4x")
 _BASE64_WHITESPACE = str.maketrans("", "", " \t\r\n")
+# Base64 is decoded in slices of this many characters (a multiple of 4): each
+# call holds the GIL, so slices bound the event-loop stall of a worker thread.
+_BASE64_SLICE_CHARS = 1 << 18
 _TENSOR_ARCHIVE_RECORDS = frozenset({
     "data.pkl", "byteorder", "version", ".format_version", ".storage_alignment",
     ".data/version", ".data/serialization_id"
@@ -238,12 +241,19 @@ def _check_tensor_pickle(pickled: bytes, max_bytes: int) -> _TensorSpec:
             f"Tensor payload size, stride or offset exceeds {max_bytes}.")
     storage_bytes = pid[4] * element_size
     logical_bytes = element_size
+    span = 1
     for dim in size:
         logical_bytes *= dim
+        span *= max(dim, 1)
     if max(logical_bytes, storage_bytes) > max_bytes:
         raise ValueError(
             f"Tensor payload describes {max(logical_bytes, storage_bytes)} "
             f"bytes, over the {max_bytes}-byte limit.")
+    # torch multiplies the sizes in order, so a zero-sized dim does not stop
+    # the others' product from overflowing.
+    if span > max_bytes:
+        raise ValueError(
+            f"Tensor payload sizes multiply to {span}, over {max_bytes}.")
     # A view repeating its storage (expand, overlapping strides) would let a
     # small archive decode to a large tensor.
     if logical_bytes > storage_bytes:
@@ -351,7 +361,7 @@ def _read_tensor_archive(content: bytes,
                     filled += len(chunk)
             if filled != storage_bytes:
                 raise ValueError("Tensor payload storage record is truncated.")
-    except ValueError:
+    except (ValueError, MemoryError):
         raise
     except Exception as e:
         # zipfile raises many types (BadZipFile, NotImplementedError,
@@ -365,8 +375,22 @@ def _b64decode_strict(text: str) -> bytes:
     """Decode standard base64, rejecting characters outside its alphabet."""
     if sys.version_info >= (3, 11):
         # Unlike base64.b64decode, this does not first copy the text to bytes.
-        return binascii.a2b_base64(text, strict_mode=True)
-    return base64.b64decode(text, validate=True)
+        def decode(piece: str) -> bytes:
+            return binascii.a2b_base64(piece, strict_mode=True)
+    else:
+
+        def decode(piece: str) -> bytes:
+            return base64.b64decode(piece, validate=True)
+
+    return b"".join(
+        decode(text[i:i + _BASE64_SLICE_CHARS])
+        for i in range(0, len(text), _BASE64_SLICE_CHARS))
+
+
+def _strip_base64_whitespace(text: str) -> str:
+    """Drop ASCII whitespace from base64 text, a slice at a time."""
+    return "".join(text[i:i + _BASE64_SLICE_CHARS].translate(_BASE64_WHITESPACE)
+                   for i in range(0, len(text), _BASE64_SLICE_CHARS))
 
 
 def load_base64_tensor(data: str, *, max_bytes: int) -> torch.Tensor:
@@ -403,7 +427,7 @@ def load_base64_tensor(data: str, *, max_bytes: int) -> torch.Tensor:
     except ValueError as e:
         # Line-wrapped base64 is accepted; only then is the text copied
         # without its whitespace.
-        stripped, content = data.translate(_BASE64_WHITESPACE), None
+        stripped, content = _strip_base64_whitespace(data), None
         if stripped != data and len(stripped) <= encoded_limit:
             try:
                 content = _b64decode_strict(stripped)
