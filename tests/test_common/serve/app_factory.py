@@ -198,6 +198,7 @@ class ServeTestEnv:
         architectures = {
             "llama": ["LlamaForCausalLM"],
             "gpt_oss": ["GptOssForCausalLM"],
+            "qwen2_vl": ["Qwen2VLForConditionalGeneration"],
         }[model_type]
         config = {"model_type": model_type, "architectures": architectures}
         if hidden_size is not None:

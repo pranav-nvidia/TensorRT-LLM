@@ -193,20 +193,25 @@ def test_completion_line_wrapped_payload_near_limit(serve_env: ServeTestEnv, mon
 
 
 @pytest.mark.parametrize(
-    "body",
+    ("body", "match"),
     [
-        {},
-        {"prompt_embeds": []},
-        {"prompt_embeds": "AAAA", "echo": True},
-        {"prompt_embeds": "AAAA", "truncate_prompt_tokens": 2},
+        ({}, "prompt"),
+        ({"prompt_embeds": []}, "empty"),
+        ({"echo": True}, "echo"),
+        ({"truncate_prompt_tokens": 2}, "truncate_prompt_tokens"),
     ],
 )
-def test_completion_request_validation(serve_env: ServeTestEnv, body: Dict[str, Any]) -> None:
+def test_completion_request_validation(
+    serve_env: ServeTestEnv, body: Dict[str, Any], match: str
+) -> None:
     """Missing prompts and options that need prompt text are rejected."""
+    if match in ("echo", "truncate_prompt_tokens"):
+        body = {"prompt_embeds": _b64(torch.zeros(2, HIDDEN)), **body}
     server, client = _client(serve_env)
     with client:
         response = _completion(client, **body)
-    assert 400 <= response.status_code < 500
+    assert response.status_code == 400
+    assert match in response.text
     assert server.generator.generate_calls == []
 
 
@@ -277,6 +282,20 @@ def test_chat_unsupported_combinations(
         response = _chat(client, [{"role": "user", "content": content}], **extra)
     assert response.status_code == 400
     assert match in response.json()["message"]
+    assert server.generator.generate_calls == []
+
+
+def test_chat_part_with_image_rejected(serve_env: ServeTestEnv) -> None:
+    """A part beside an image is refused before the image loads (this URL is never fetched)."""
+    server = serve_env.build_openai_server(
+        AggConfig(model_type="qwen2_vl", enable_prompt_embeds=True, hidden_size=HIDDEN)
+    )
+    image = {"type": "image_url", "image_url": {"url": "http://127.0.0.1:9/a.png"}}
+    content = [_part(torch.zeros(2, HIDDEN)), image]
+    with serve_env.client(server.app) as client:
+        response = _chat(client, [{"role": "user", "content": content}])
+    assert response.status_code == 400
+    assert "multimodal" in response.json()["message"]
     assert server.generator.generate_calls == []
 
 
@@ -430,6 +449,16 @@ def _bos_eos_tokenize(text: str, add_special_tokens: bool) -> List[int]:
     """One id per character; 99 and 98 stand for BOS and EOS."""
     ids = [ord(c) for c in text]
     return [99] + ids + [98] if add_special_tokens else ids
+
+
+def test_splice_places_parts_in_rendered_order() -> None:
+    """Parts the template renders out of request order take their own rows."""
+    parts = [ChatPromptEmbedsPart("<A>", ""), ChatPromptEmbedsPart("<B>", "")]
+    rows = [torch.full((1, 4), 1.0), torch.full((2, 4), 2.0)]
+    out = splice_chat_prompt_embeds("x<B>y<A>", parts, rows, _identity_tokenize, False)
+    assert out["prompt_token_ids"] == [ord("x"), 0, 0, ord("y"), 0]
+    assert out["prompt_embeds_mask"] == [False, True, True, False, True]
+    assert torch.equal(out["prompt_embeds"], torch.cat([rows[1], rows[0]]))
 
 
 def test_splice_wraps_whole_prompt_in_special_tokens() -> None:
