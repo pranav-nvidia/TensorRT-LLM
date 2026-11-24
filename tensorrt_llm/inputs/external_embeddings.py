@@ -66,7 +66,7 @@ def _as_int_tuple(value: Any, name: str) -> tuple[int, ...]:
     result = []
     for entry in value:
         if isinstance(entry, bool) or not isinstance(entry, int):
-            raise TypeError(f"{name} must hold integers, got {type(entry).__name__}")
+            raise ValueError(f"{name} must hold integers, got {type(entry).__name__}")
         result.append(int(entry))
     return tuple(result)
 
@@ -80,7 +80,7 @@ def _as_float_tuple(value: Any, name: str) -> tuple[float, ...]:
     result = []
     for entry in value:
         if isinstance(entry, bool) or not isinstance(entry, (int, float)):
-            raise TypeError(f"{name} must hold numbers, got {type(entry).__name__}")
+            raise ValueError(f"{name} must hold numbers, got {type(entry).__name__}")
         entry = float(entry)
         if not math.isfinite(entry):
             raise ValueError(f"{name} must hold finite numbers")
@@ -91,7 +91,7 @@ def _as_float_tuple(value: Any, name: str) -> tuple[float, ...]:
 def _as_positive_float(value: Any, name: str) -> float:
     """Convert a scalar to a finite positive float."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"{name} must be a number, got {type(value).__name__}")
+        raise ValueError(f"{name} must be a number, got {type(value).__name__}")
     value = float(value)
     if not math.isfinite(value) or value <= 0:
         raise ValueError(f"{name} must be finite and positive, got {value}")
