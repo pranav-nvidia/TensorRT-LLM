@@ -20,8 +20,11 @@ out = llm.generate({"prompt_embeds": rows}, SamplingParams(max_tokens=32))
 Embeddings for some positions of a token prompt: `prompt_embeds_mask` marks, in order, the positions that take the next row. The ids at those positions are placeholders.
 
 ```python
-ids = llm.tokenizer.encode("Describe the product: <item> in one sentence.")
-mask = [i in item_positions for i in range(len(ids))]
+item_rows = torch.load("item_rows.pt")  # [num_item_rows, hidden_size], e.g. from a product encoder
+prefix = llm.tokenizer.encode("Describe the product:")
+suffix = llm.tokenizer.encode(" in one sentence.", add_special_tokens=False)
+ids = prefix + [0] * len(item_rows) + suffix  # 0 is the placeholder id at the item positions
+mask = [False] * len(prefix) + [True] * len(item_rows) + [False] * len(suffix)
 out = llm.generate(
     {"prompt_token_ids": ids, "prompt_embeds": item_rows, "prompt_embeds_mask": mask},
     SamplingParams(max_tokens=32),
