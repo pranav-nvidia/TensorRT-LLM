@@ -1242,6 +1242,32 @@ class TestEmbedsParts:
         assert torch.equal(item.pop("mm_embeddings"), embedding)
         assert item == {"video_grid_thw": [2, 4, 4], "fps": 2.0, "frames_indices": [0, 1, 2, 3]}
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("part_type", "metadata", "key"),
+        [
+            ("image_embeds", {}, "image_grid_thw"),
+            ("video_embeds", {"video_grid_thw": [2, 4, 4]}, "fps"),
+        ],
+    )
+    async def test_null_metadata_is_absent(self, mm_tracker, part_type, metadata, key):
+        import torch
+
+        from tensorrt_llm.inputs.external_embeddings import parse_external_embeddings
+
+        data = _b64_tensor(torch.randn(8, 4))
+        modality = part_type.split("_")[0]
+        parsed = []
+        for content in ({**metadata}, {**metadata, key: None}):
+            part = {"type": part_type, part_type: {"data": data, **content}}
+            item = await parse_chat_message_content_part(part, mm_tracker)["data"]
+            (parsed_item,) = parse_external_embeddings({modality: [item]})[modality]
+            parsed.append(parsed_item)
+        missing, null = parsed
+        # The model sees the same item, so a required key fails the same way.
+        assert null.grid_thw == missing.grid_thw and null.fps == missing.fps
+        assert torch.equal(null.embedding, missing.embedding)
+
     @pytest.mark.parametrize(
         ("part", "match"),
         [

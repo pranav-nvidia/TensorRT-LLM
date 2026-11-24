@@ -165,12 +165,16 @@ def _parse_embeds_part(
     if not isinstance(data, str) or not data:
         raise ValueError(
             f"'{part_type}' requires a non-empty base64 'data' string.")
-    metadata = {key: value for key, value in content.items() if key != "data"}
-    unknown = set(metadata) - _EMBEDS_METADATA_KEYS[part_type]
+    unknown = set(content) - {"data"} - _EMBEDS_METADATA_KEYS[part_type]
     if unknown:
         raise ValueError(
             f"Unsupported '{part_type}' fields: {sorted(unknown)}; "
             f"allowed: {sorted(_EMBEDS_METADATA_KEYS[part_type])}.")
+    # A JSON null means the key is absent.
+    metadata = {
+        key: value
+        for key, value in content.items() if key != "data" and value is not None
+    }
     max_bytes = mm_embeds_max_bytes()
     mm_data_tracker.charge_embedding_payload(len(data), max_bytes)
 
