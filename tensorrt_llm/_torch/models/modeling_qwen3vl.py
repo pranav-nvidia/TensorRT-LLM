@@ -353,7 +353,7 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
 
         Deepstack features are concatenated after the main embedding along the
         last dim, the layout the TRT-LLM vision encoder emits. Checkpoints
-        without deepstack levels (Qwen3.5) take plain hidden-size rows.
+        without deepstack levels (Qwen3.5, Cosmos3-Edge) take plain hidden-size rows.
         """
         levels = getattr(self.config.vision_config, "deepstack_visual_indexes", None)
         return self.config.text_config.hidden_size * (1 + len(levels or []))
@@ -716,12 +716,7 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         if not isinstance(mm_handles, list):
             raise TypeError("mm_handles must be a list")
 
-        # Edge has no deepstack indexes. A missing field is zero levels.
-        deepstack_indexes = getattr(self.config.vision_config, "deepstack_visual_indexes", None)
-        num_deepstack_levels = len(deepstack_indexes or [])
-        # This is because, unlike previous Qwen VL models, the embeddings are concatenated with
-        # feature maps from deepstack layers.
-        expected_size = self.config.text_config.hidden_size * (1 + num_deepstack_levels)
+        expected_size = self._external_embedding_width()
         for i, mm_handle in enumerate(mm_handles):
             if len(mm_handle["tensor_size"]) != 2:
                 raise ValueError(f"Multimodal embedding {i} must be rank 2")
