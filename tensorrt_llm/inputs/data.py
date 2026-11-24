@@ -111,7 +111,8 @@ class TokensPrompt(TypedDict):
     decoding, attention data parallelism and context parallelism are rejected.
     Disaggregated serving needs the V2 manager; the generation-only request
     takes the identity from the context result's ``disaggregated_params`` and
-    needs no rows (any it passes must match).
+    needs no rows (any it passes must match). CSA2 remote-tail replay
+    (DeepSeek-V4.1 disaggregated serving) does not take prompt_embeds.
     """
 
     prompt_embeds_mask: NotRequired[Union[List[bool], torch.Tensor]]
