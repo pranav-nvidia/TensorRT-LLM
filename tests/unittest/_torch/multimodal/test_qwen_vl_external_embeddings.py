@@ -270,7 +270,11 @@ def test_qwen2_5_video_positions_past_rotary_table_are_rejected(timing, match):
 
 
 def _admitted(
-    mrope_config: dict, prompt_len: int, max_new_tokens: int, draft_tokens: int = 0
+    mrope_config: dict,
+    prompt_len: int,
+    max_new_tokens: int,
+    draft_tokens: int = 0,
+    max_positions: int = 128000,
 ) -> LlmRequest:
     """A request after the Qwen-VL model's admission hook."""
     request = LlmRequest(
@@ -282,6 +286,7 @@ def _admitted(
         py_multimodal_data={"mrope_config": mrope_config},
     )
     pretrained_config = _make_processor(Qwen2_5VLInputProcessorBase).config
+    pretrained_config.text_config.max_position_embeddings = max_positions
     spec_config = SimpleNamespace(max_total_draft_tokens=draft_tokens) if draft_tokens else None
     model = SimpleNamespace(
         model_config=SimpleNamespace(pretrained_config=pretrained_config, spec_config=spec_config)
@@ -296,15 +301,23 @@ def test_qwen2_5_video_decoding_is_capped_at_admission():
     tokens, extra = _attach_framed_video(processor, _video(8, 2, 2, second_per_grid_ts=9141.0))
     mrope_config = extra["multimodal_data"]["mrope_config"]
     capped = _admitted(mrope_config, len(tokens), 128000 - len(tokens))
-    assert capped.max_new_tokens == capped.py_max_new_tokens == 23
+    assert capped.max_new_tokens == capped.py_max_new_tokens == 24
     assert _admitted(mrope_config, len(tokens), 5).py_max_new_tokens == 5
-    # A speculative step forwards its draft tokens past the last accepted one.
-    assert _admitted(mrope_config, len(tokens), 100, draft_tokens=3).max_new_tokens == 20
     # Positions that trail the token count leave max_seq_len as the only limit.
     trailing = {"mrope_position_deltas": torch.tensor([[-50]], dtype=torch.int32)}
     assert _admitted(trailing, 10, 10**6).max_new_tokens == 10**6
+
+
+def test_mrope_decode_cap_counts_forwarded_positions():
+    # Prompt positions 0..99 shifted by 32667 end at 32766; the last sampled token is not
+    # forwarded, so two new tokens write only position 32767.
+    deltas = {"mrope_position_deltas": torch.tensor([[32667]], dtype=torch.int32)}
+    assert _admitted(deltas, 100, 2, max_positions=32768).max_new_tokens == 2
+    assert _admitted(deltas, 100, 3, max_positions=32768).max_new_tokens == 2
+    # A speculative step forwards its draft tokens past the last accepted one.
+    assert _admitted(deltas, 100, 10, draft_tokens=1, max_positions=32768).max_new_tokens == 1
     with pytest.raises(ValueError, match="start past"):
-        _admitted({"mrope_position_deltas": torch.tensor([[127990]])}, 10, 1)
+        _admitted(deltas, 100, 10, draft_tokens=2, max_positions=32768)
 
 
 def test_qwen2_5_video_without_max_tokens_is_capped_not_rejected():
@@ -316,7 +329,7 @@ def test_qwen2_5_video_without_max_tokens_is_capped_not_rejected():
         SamplingParams(max_tokens=None),
     )
     request = _admitted(extra["multimodal_data"]["mrope_config"], len(tokens), 4096 - len(tokens))
-    assert request.max_new_tokens == request.py_max_new_tokens == 23
+    assert request.max_new_tokens == request.py_max_new_tokens == 24
 
 
 @pytest.mark.parametrize("timestamps", [[0.0, 1e308], [-1.0, 0.0]])

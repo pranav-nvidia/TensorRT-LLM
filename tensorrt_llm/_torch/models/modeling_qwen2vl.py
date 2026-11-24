@@ -1288,8 +1288,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         mrope_position_ids, mrope_position_deltas = type(self).get_rope_index(
             self.config, input_ids, image_grid_thw, video_grid_thw,
             attention_mask, second_per_grid_ts)
-        self._check_mrope_positions(mrope_position_ids, mrope_position_deltas,
-                                    input_ids.shape[-1])
+        self._check_mrope_positions(mrope_position_ids)
 
         mrope_config = {}
         mrope_config['mrope_position_ids'] = mrope_position_ids.to(
@@ -1298,14 +1297,11 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             'cpu').to(torch.int32).clone()
         return mrope_config
 
-    def _check_mrope_positions(self, position_ids: torch.Tensor,
-                               position_deltas: torch.Tensor,
-                               prompt_length: int) -> None:
-        """Reject prompts whose positions leave no room in the rotary table.
+    def _check_mrope_positions(self, position_ids: torch.Tensor) -> None:
+        """Reject prompts whose positions fall outside the rotary table.
 
         A video time scale moves positions independently of the token count.
-        The prompt and at least the first decode position must fit; admission
-        caps the rest of decoding (cap_mrope_decode_tokens).
+        Admission caps decoding to the table (cap_mrope_decode_tokens).
         """
         text_config = getattr(self.config, "text_config", self.config)
         max_positions = getattr(text_config, "max_position_embeddings", None)
@@ -1316,11 +1312,6 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             raise ValueError(
                 f"Qwen mRoPE positions exceed the model's {max_positions} "
                 "positions; check the video time scale")
-        if position_deltas.numel() and (
-                prompt_length + int(position_deltas.max()) >= max_positions):
-            raise ValueError(
-                f"Qwen mRoPE decode positions start past the model's "
-                f"{max_positions} positions; check the video time scale")
 
     # Qwen-VL prompt placeholders for one image or video item. A video is
     # framed by vision start / end; Qwen3-VL also accepts it bare.
@@ -2505,9 +2496,10 @@ def cap_mrope_decode_tokens(request: Any,
     A positive mRoPE delta puts decode positions ahead of the token count,
     which max_seq_len bounds, so a request may run past the
     max_position_embeddings rotary table. The executor runs this at
-    admission, after max_new_tokens is clamped to max_seq_len. ``lookahead``
-    reserves the draft tokens a speculative step forwards past the last
-    accepted token.
+    admission, after max_new_tokens is clamped to max_seq_len. Every new
+    token but the last is forwarded, the first at ``prompt_len + delta``.
+    ``lookahead`` reserves the draft tokens a speculative step forwards past
+    the last accepted token.
     """
     max_positions = getattr(text_config, "max_position_embeddings", None)
     mrope_config = (request.py_multimodal_data or {}).get("mrope_config") or {}
@@ -2518,7 +2510,7 @@ def cap_mrope_decode_tokens(request: Any,
     delta = int(deltas.max())
     if delta <= 0:
         return
-    budget = max_positions - request.orig_prompt_len - delta - lookahead
+    budget = max_positions - request.orig_prompt_len - delta + 1 - lookahead
     if budget <= 0:
         raise ValueError(
             f"Qwen mRoPE decode positions start past the model's "
