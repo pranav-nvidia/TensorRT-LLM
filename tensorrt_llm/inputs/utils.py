@@ -302,7 +302,7 @@ def _check_central_directory_size(content: bytes) -> None:
 
 
 def _read_tensor_archive(content: bytes,
-                         max_bytes: int) -> Tuple[_TensorSpec, bytearray]:
+                         max_bytes: int) -> Tuple[_TensorSpec, torch.Tensor]:
     """Check a ``torch.save`` archive of one tensor and read its storage.
 
     Only the zip format with the records ``torch.save`` writes for one tensor,
@@ -310,7 +310,7 @@ def _read_tensor_archive(content: bytes,
     rebuild one float16, bfloat16 or float32 tensor.
 
     Returns:
-        The tensor's fields and its storage record's bytes, writable.
+        The tensor's fields and its storage record's bytes as a uint8 tensor.
     """
     _check_central_directory_size(content)
     try:
@@ -363,8 +363,11 @@ def _read_tensor_archive(content: bytes,
                 raise ValueError("Tensor payload must be little-endian.")
             # Copy in chunks into the tensor's buffer, so no second full copy
             # exists; zipfile checks the record's CRC once all of it is read.
-            storage = bytearray(storage_bytes)
-            view, filled = memoryview(storage), 0
+            # The buffer is not zero-filled, since every byte is overwritten.
+            storage = torch.empty(storage_bytes,
+                                  dtype=torch.uint8,
+                                  device="cpu")
+            view, filled = memoryview(storage.numpy()), 0
             with archive.open(prefix + data[0]) as record:
                 while chunk := record.read(1 << 20):
                     if filled + len(chunk) > storage_bytes:
@@ -463,9 +466,8 @@ def load_base64_tensor(data: str, *, max_bytes: int) -> torch.Tensor:
         raise ValueError(f"Tensor payload is {len(content)} bytes, over the "
                          f"{max_bytes}-byte limit.")
     spec, storage = _read_tensor_archive(content, max_bytes)
-    flat = (torch.frombuffer(storage, dtype=spec.dtype)
-            if storage else torch.empty(0, dtype=spec.dtype, device="cpu"))
-    return flat.as_strided(spec.size, spec.stride, spec.offset)
+    return storage.view(spec.dtype).as_strided(spec.size, spec.stride,
+                                               spec.offset)
 
 
 async def async_load_base64_tensor(data: str, *,
