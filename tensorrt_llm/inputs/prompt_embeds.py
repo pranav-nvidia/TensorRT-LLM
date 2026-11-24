@@ -297,6 +297,12 @@ def remap_prompt_embeds(
     rows = prompt_embeds.positions.tolist()
     if any(p in placeholders for p in rows):
         raise ValueError("prompt_embeds_mask selects a multimodal placeholder position.")
+    if any(mapping[p] == _AMBIGUOUS for p in rows):
+        raise ValueError(
+            "prompt_embeds_mask selects a token after the framing multimodal processing "
+            "inserts before an item; its place is ambiguous because the framing can hold "
+            "the same id. Keep that position a token."
+        )
     if any(mapping[p] < 0 for p in rows):
         raise ValueError(
             "prompt_embeds_mask selects a token that multimodal processing merged "
@@ -321,6 +327,10 @@ def _raise_unaligned() -> None:
     )
 
 
+# ``_align_gap`` value of a token matched from the end of a gap after inserted framing.
+_AMBIGUOUS = -2
+
+
 def _align_gap(
     segment: Sequence[int], expanded_ids: Sequence[int], begin: int, end: int, framed: bool
 ) -> list[int]:
@@ -328,6 +338,8 @@ def _align_gap(
 
     ``framed``: an item starts at ``end`` and framing inserted before it may
     merge with the last text tokens, so the segment matches from both ends.
+    Tokens matched from the end after framing was inserted are ``_AMBIGUOUS``:
+    the framing can contain their id.
     """
     n = len(segment)
     head = 0
@@ -344,9 +356,10 @@ def _align_gap(
         and expanded_ids[end - 1 - tail] == segment[n - 1 - tail]
     ):
         tail += 1
-    return (
-        list(range(begin, begin + head)) + [-1] * (n - head - tail) + list(range(end - tail, end))
-    )
+    tail_positions = list(range(end - tail, end))
+    if head < n and end - begin > n:
+        tail_positions = [_AMBIGUOUS] * tail
+    return list(range(begin, begin + head)) + [-1] * (n - head - tail) + tail_positions
 
 
 def multimodal_item_spans(multimodal_input: "MultimodalInput") -> list[tuple[int, int]]:

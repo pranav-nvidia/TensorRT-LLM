@@ -227,6 +227,10 @@ def test_remap_text_merged_with_framing() -> None:
     _, merged = build_prompt_embeds(original, _rows(1), [False, True] + [False] * 4)
     with pytest.raises(ValueError, match="merged"):
         remap_prompt_embeds(merged, original, expanded, [(4, 6)])
+    # The framing (62, 2) holds the text id 2: matching from the end could land on it.
+    repeated = [1, 62, 2, 50, 53, 53, 52, 3]
+    with pytest.raises(ValueError, match="ambiguous"):
+        remap_prompt_embeds(merged, original, repeated, [(4, 6)])
 
 
 def test_remap_text_after_video_matching_timestamp() -> None:
