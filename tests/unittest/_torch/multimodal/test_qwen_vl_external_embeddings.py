@@ -307,6 +307,18 @@ def test_qwen2_5_video_decoding_is_capped_at_admission():
         _admitted({"mrope_position_deltas": torch.tensor([[127990]])}, 10, 1)
 
 
+def test_qwen2_5_video_without_max_tokens_is_capped_not_rejected():
+    processor = _make_processor(Qwen2_5VLInputProcessorBase, tokens_per_second=2)
+    # trtllm-serve leaves max_tokens unset; the worker then fills max_seq_len - prompt_len.
+    tokens, extra = processor.attach_multimodal_embeddings(
+        {"prompt": "<|vision_start|><|video_pad|><|vision_end|>"},
+        {"video": [_video(8, 2, 2, second_per_grid_ts=9141.0)]},
+        SamplingParams(max_tokens=None),
+    )
+    request = _admitted(extra["multimodal_data"]["mrope_config"], len(tokens), 4096 - len(tokens))
+    assert request.max_new_tokens == request.py_max_new_tokens == 23
+
+
 @pytest.mark.parametrize("timestamps", [[0.0, 1e308], [-1.0, 0.0]])
 def test_qwen3_out_of_range_timestamps_are_rejected(timestamps):
     processor = _make_processor(Qwen3VLInputProcessorBase)
