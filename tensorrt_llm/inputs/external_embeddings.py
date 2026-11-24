@@ -3,7 +3,7 @@
 """Precomputed multimodal embeddings passed through ``multi_modal_embeddings``.
 
 Each entry of ``multi_modal_embeddings[modality]`` is either a bare tensor of
-shape ``[rows, width]`` or a dict holding the tensor under ``"embedding"``
+shape ``[rows, width]`` or a dict holding the tensor under ``"mm_embeddings"``
 plus the geometry and timing metadata that the raw-media path would have
 derived from the image or video (grid, timestamps, ...). Models validate the
 metadata they need; this module only normalizes the container.
@@ -19,7 +19,7 @@ EXTERNAL_EMBEDDING_MODALITIES = ("image", "video")
 
 _ITEM_KEYS = frozenset(
     {
-        "embedding",
+        "mm_embeddings",
         "image_grid_thw",
         "video_grid_thw",
         "timestamps",
@@ -123,8 +123,8 @@ def _parse_item(modality: str, index: int, entry: Any) -> ExternalEmbeddingItem:
     unknown = set(entry) - _ITEM_KEYS
     if unknown:
         raise ValueError(f"{name} has unknown keys {sorted(unknown)}")
-    if "embedding" not in entry:
-        raise ValueError(f"{name} is missing 'embedding'")
+    if "mm_embeddings" not in entry:
+        raise ValueError(f"{name} is missing 'mm_embeddings'")
     grid_key = f"{modality}_grid_thw"
     other_grid_key = "video_grid_thw" if modality == "image" else "image_grid_thw"
     if other_grid_key in entry:
@@ -147,7 +147,7 @@ def _parse_item(modality: str, index: int, entry: Any) -> ExternalEmbeddingItem:
 
     return ExternalEmbeddingItem(
         modality,
-        _check_embedding_tensor(entry["embedding"], name),
+        _check_embedding_tensor(entry["mm_embeddings"], name),
         grid_thw=grid,
         timestamps=optional("timestamps", _as_float_tuple),
         fps=optional("fps", _as_positive_float),

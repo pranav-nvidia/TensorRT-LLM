@@ -277,9 +277,13 @@ def test_external_embeddings_reuse_common_item_metadata(model):
     mrope_config = {"mrope_position_deltas": torch.zeros(1, dtype=torch.int32)}
     processor.get_mrope_config = lambda *args: mrope_config
     embeddings = [torch.ones(4, 16), torch.ones(9, 16)]
+    items = [
+        {"mm_embeddings": embeddings[0], "image_grid_thw": [1, 4, 4]},
+        {"mm_embeddings": embeddings[1], "image_grid_thw": [1, 6, 6]},
+    ]
 
     result, extra = processor.attach_multimodal_embeddings(
-        {"prompt": "<|image_pad|> and <|image_pad|>"}, {"image": embeddings}, SamplingParams()
+        {"prompt": "<|image_pad|> and <|image_pad|>"}, {"image": items}, SamplingParams()
     )
     params = MultimodalParams(**extra)
 

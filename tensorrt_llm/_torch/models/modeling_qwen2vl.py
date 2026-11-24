@@ -36,7 +36,6 @@ from tensorrt_llm.inputs.external_embeddings import (ExternalEmbeddingItem,
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalItemMetadata,
     MultimodalItemPartition, MultimodalParams)
-from tensorrt_llm.inputs.registry import ATTACHED_ITEM_IDENTITIES_KEY
 
 from ..._utils import async_tensor_h2d, nvtx_range
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -444,6 +443,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                                     multimodal_data,
                                                     mm_item_order)
         if metadata is not None:
+            item_grids = {}
             for modality in ("image", "video"):
                 modality_data = multimodal_data.get(modality)
                 grid_key = "image_grid_thw" if modality == "image" else "video_grid_thw"
@@ -452,6 +452,20 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                     metadata.input_partitions[
                         modality] = _qwen_vision_input_partitions(
                             multimodal_data, modality, metadata)
+                    item_grids[modality] = [{
+                        grid_key: grid
+                    } for grid in modality_data[grid_key].tolist()]
+            if item_grids:
+                # Each item's grid, in prompt order. The standalone encoder
+                # returns it with the item's embedding: a prefill worker that
+                # gets the embedding without this encoder's mRoPE positions
+                # (for example from an embedding cache) needs the grid to
+                # build them. It is read here, on the host, because that
+                # encoder moves the grids to the GPU before its forward.
+                multimodal_data["multimodal_embedding_metadata"] = [
+                    item_grids[modality][index]
+                    for modality, index in metadata.item_refs
+                ]
         return metadata
 
     # ------------------------------------------------------------------
@@ -1318,23 +1332,6 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                 f"model's {max_positions} positions; set max_tokens to at most "
                 f"{max_positions - prompt_length - delta}")
 
-    @staticmethod
-    def _infer_image_grid_thw(num_tokens: int,
-                              spatial_merge_size: int) -> List[int]:
-        if num_tokens <= 0:
-            raise ValueError(
-                f"Image embedding must contain at least one token, got {num_tokens}"
-            )
-        llm_grid_h = int(num_tokens**0.5)
-        while llm_grid_h > 1 and num_tokens % llm_grid_h != 0:
-            llm_grid_h -= 1
-        llm_grid_w = num_tokens // llm_grid_h
-        return [
-            1,
-            llm_grid_h * spatial_merge_size,
-            llm_grid_w * spatial_merge_size,
-        ]
-
     # Qwen-VL prompt placeholders for one image or video item. A video is
     # framed by vision start / end; Qwen3-VL also accepts it bare.
     _EXTERNAL_PLACEHOLDER_RE = re.compile(
@@ -1393,35 +1390,21 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         return (self._VISION_START + self._VIDEO_PAD * item.num_rows +
                 self._VISION_END)
 
-    def _external_item_identity(
-            self, grid_thw: Tuple[int, int, int],
-            video_metadata: Dict[str, Any]) -> Dict[str, Any]:
-        """Metadata that shapes MRoPE positions without changing the rows.
-
-        Qwen2-VL / Qwen2.5-VL also scale video time by the seconds per
-        temporal patch, which leaves the prompt unchanged.
-        """
-        return {"grid_thw": list(grid_thw), **video_metadata}
-
     def _validate_external_embedding_grid(
         self,
         item: ExternalEmbeddingItem,
         index: int,
     ) -> Tuple[int, int, int]:
-        """Check the item's grid against its rows; infer image grids if absent."""
+        """Check the item's grid against its rows."""
         merge = self.config.vision_config.spatial_merge_size
         name = f"{item.modality} embedding {index}"
         grid = item.grid_thw
         if grid is None:
-            if item.modality == "video":
-                raise ValueError(f"{name} requires 'video_grid_thw'")
-            logger.warning_once(
-                "An image embedding was given without 'image_grid_thw'; "
-                "inferring a near-square grid from its row count. MRoPE "
-                "positions match the raw image only for square grids, so pass "
-                "'image_grid_thw' for exact results.",
-                key="qwen_vl_image_embedding_grid_inferred")
-            return tuple(self._infer_image_grid_thw(item.num_rows, merge))
+            # MRoPE positions depend on the grid, which the rows alone do not
+            # give; take it from the model's image or video processor.
+            raise ValueError(
+                f"{name} requires '{item.modality}_grid_thw' for mRoPE "
+                "positions")
         t, h, w = grid
         if item.modality == "image" and t != 1:
             raise ValueError(
@@ -1447,8 +1430,8 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
 
         The prompt is expanded exactly as the HF processor expands it for the
         equivalent raw media (including Qwen3 frame timestamps). The request
-        carries MRoPE positions and per-item identities of the metadata that
-        shapes them, which the wrapper keys together with the rows.
+        carries MRoPE positions; the wrapper keys each item by its rows and the
+        metadata passed with them.
         """
         build_disagg_prefill_multimodal_inputs = getattr(
             self, "build_disagg_prefill_multimodal_inputs", None)
@@ -1487,7 +1470,6 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                 "use one form for all videos")
         ordered_items: List[ExternalEmbeddingItem] = []
         item_refs: List[Tuple[str, int]] = []
-        identities: List[Dict[str, Any]] = []
         consumed = {"image": 0, "video": 0}
         pieces: List[str] = []
         last_end = 0
@@ -1503,10 +1485,6 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             item = items[index]
             ordered_items.append(item)
             item_refs.append((modality, index))
-            identities.append(
-                self._external_item_identity(
-                    grids[modality][index],
-                    video_metadata[index] if modality == "video" else {}))
             pieces.append(text_prompt[last_end:match.start()])
             if modality == "image":
                 pieces.append(self._IMAGE_PAD * item.num_rows)
@@ -1550,10 +1528,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                   second_per_grid_ts,
                                   sampling_params.max_tokens),
         }
-        return prompt_token_ids, {
-            "multimodal_data": multimodal_data,
-            ATTACHED_ITEM_IDENTITIES_KEY: identities,
-        }
+        return prompt_token_ids, {"multimodal_data": multimodal_data}
 
     @nvtx_range("Qwen2VLInputProcessorBase forward()")
     @torch.inference_mode()
